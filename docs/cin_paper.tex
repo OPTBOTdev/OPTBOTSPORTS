@@ -1,0 +1,479 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{array}
+
+\newtheorem{assumption}{Assumption}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ind}{\mathbb{1}}
+\newcommand{\henv}{h_{\mathrm{env}}}
+\newcommand{\doop}[1]{\mathrm{do}(#1)}
+
+\title{\textbf{The Portability CIN:\\ Calibrated Counterfactual Projection of NHL Player Impact\\ under Environment Interventions}}
+\author{OptBot Research \\ \small Technical Report v1.0 --- July 2026 --- Confidential}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent We present the Portability Causal Intervention Network (CIN), a system that projects
+a professional hockey player's on-ice impact in an environment he has never played in ---
+a new team, line, and role --- before a single shift is observed there. The central design
+thesis is that credible causal AI is achieved not by architectural scale but by four
+enforceable commitments: (C1) answering only intervention classes that occur as natural
+experiments in the data, with tiered refusal outside support; (C2) structural deconfounding
+of player talent from deployment via a frozen, out-of-fold talent channel; (C3) optimizing
+the model on the distribution it will be queried on, by up-weighting windows adjacent to
+observed context switches; and (C4) conformal calibration of uncertainty on the intervention
+distribution itself, with achieved coverage attached to every emitted interval. On a
+frozen-clock backtest of 635 real player--team transitions (2021--2025), the minimal
+instantiation of the system (v0: destination-environment expectation plus a shrunken
+residual talent prior) attains RMSE 5.30 on first-40-game on-ice expected-goal share,
+versus 5.80 for a Marcel-style industry baseline ($-8.6\%$; bootstrap 95\% CI on the
+difference $[-0.67, -0.33]$, excluding zero) and 7.40 for last-season carryover. Emitted
+80\% intervals achieve 79.8\% empirical coverage. We give the complete data substrate,
+estimators, neural architecture, leakage-audit methodology (including three data corruptions
+whose discovery materially changed the system), and an 18-item threat model.
+\end{abstract}
+
+\section{Introduction}
+
+Player acquisition in the National Hockey League is a capital-allocation problem executed
+under a specific epistemic handicap: all available statistics describe a player's output
+\emph{in his previous environment}. On-ice results in hockey are violently contextual ---
+linemates, opposition, deployment, coaching system, and schedule jointly determine a large
+fraction of observed variance --- so the acquisition decision is, implicitly, a causal
+question: \emph{what would this player's output be under our environment?} Formally it is a
+counterfactual query, and the industry answers it today with heuristics (scouting intuition)
+or context-free extrapolations (weighted averages of past seasons).
+
+This report documents a system that answers the query directly and, more importantly,
+\emph{auditable-ly}. Our position is that ``causal AI'' fails in practice for reasons that
+are disciplinary rather than architectural: systems answer interventions their data never
+contained, entangle treatment assignment with subject quality, extrapolate without support
+diagnostics, and report uncertainty that has never been checked against realized frequencies.
+Sections~\ref{sec:formulation}--\ref{sec:serving} present a design in which each of these
+failure modes is closed by an explicit, testable mechanism rather than by optimism.
+
+Two results anchor the report. First, the minimal version of the system already clears the
+strongest public baseline with a confidence interval excluding zero
+(Section~\ref{sec:eval}). Second, the engineering audit that preceded any modeling
+(Section~\ref{sec:data}) discovered three silent data corruptions --- including an outcomes
+column that was identically zero across 761{,}823 rows --- whose repair retroactively
+explains the failure of a previous uncertainty model. We consider the audit methodology as
+much a contribution as the architecture.
+
+\section{Problem Formulation}\label{sec:formulation}
+
+\subsection{Units and notation}
+
+The atomic observational unit is the \emph{window}: a maximal interval of game time with
+constant on-ice personnel and manpower state, indexed $w$. Each window carries, for a focal
+player $p$ present in it:
+\begin{itemize}[nosep]
+\item exposure $s_w > 0$ (the focal player's seconds on ice in $w$);
+\item an environment description $e_w = (c_w,\, T_w,\, V_w)$: pre-faceoff context $c_w$
+(score state, zone start, period, rink, schedule, manpower, team-level priors), the teammate
+multiset $T_w$ with co-presence seconds, and the opponent multiset $V_w$;
+\item a lever vector $\ell_w \in \R^{17}$ of coach-controlled deployment quantities;
+\item an outcome vector $Y_w \in \R^{10}$: on-ice expected goals for/against (xGF, xGA),
+goals, shots, and four microstatistics, all attributed over $s_w$.
+\end{itemize}
+Windows aggregate to player-games and player-seasons in the obvious exposure-weighted way.
+We write $Y^{60}$ for per-60-minute rates and
+$\mathrm{xGF}\% = \mathrm{xGF}^{60} / (\mathrm{xGF}^{60} + \mathrm{xGA}^{60})$.
+
+\subsection{The estimand}
+
+Fix a player $p$ with history $\mathcal{H}_p(t_0)$ up to a freeze date $t_0$, and a
+\emph{hypothetical} environment distribution $\mathcal{E}'$ --- in the product, the empirical
+window distribution of a destination team's line slot, with teammates optionally pinned by
+the user. The target is the interventional mean over a horizon $H$ (first 40 games):
+\begin{equation}
+\theta(p, \mathcal{E}', t_0) \;=\;
+\E\!\left[\, \bar{Y}^{60}_{p,H} \;\middle|\; \doop{E \sim \mathcal{E}'},\; \mathcal{H}_p(t_0) \right],
+\label{eq:estimand}
+\end{equation}
+reported as $\mathrm{xGF}\%$ with an interval $[\theta_L, \theta_U]$ whose nominal coverage
+must match realized coverage on historical interventions (Section~\ref{sec:conformal}).
+
+\subsection{Identification}
+
+Equation~\eqref{eq:estimand} is identified from observational data under the following
+assumptions, each of which is engineered toward rather than assumed:
+
+\begin{assumption}[Overlap on the intervention class]\label{as:overlap}
+$\mathcal{E}'$ lies within the support of environments realized by players comparable to
+$p$. \emph{Enforcement:} the intervention class is restricted to environment swaps ---
+of which the ledger contains 729 natural instances --- and a support gate refuses queries
+outside observed ranges (Section~\ref{sec:support}).
+\end{assumption}
+
+\begin{assumption}[Conditional ignorability given talent and context]\label{as:ignor}
+$Y_w \perp E_w \mid (z_p, c_w, \ell_w)$, where $z_p$ is player ability. Deployment is
+assigned by coaches \emph{on their beliefs about ability}; conditioning on an explicit,
+externally estimated ability quantity $z_p$ is what renders the assignment ignorable.
+\emph{Enforcement:} $z_p$ is estimated out-of-fold from a baseline that never observes
+player identity (Section~\ref{sec:talent}) and enters the model through a dedicated channel
+(C2), so environment coefficients cannot absorb it.
+\end{assumption}
+
+\begin{assumption}[Consistency / no interference across the swap]\label{as:consistency}
+The player's ability transports across environments over the projection horizon; general
+equilibrium effects of the acquisition on the rest of the league are negligible at
+window scale.
+\end{assumption}
+
+\begin{remark}
+Assumption~\ref{as:ignor} is the load-bearing one and it is only as good as $z_p$. The
+residual confounding from imperfect $z_p$ is not argued away: it is \emph{priced} --- the
+conformal layer is fit on realized intervention errors and therefore absorbs, empirically,
+whatever ignorability violations survive (Section~\ref{sec:threats}, T1--T3).
+\end{remark}
+
+\section{Relation to Prior Approaches}
+
+\textbf{Marcel-class projections} (weighted multi-season averages with regression to the
+mean and an age adjustment) are the de facto industry standard; they are environment-blind
+by construction and serve as our primary baseline. \textbf{RAPM/WAR-family models} estimate
+context-adjusted player value by ridge regression over on-ice indicator matrices; they share
+our goal of separating player from context but produce retrospective value, not forward
+projections under specified interventions, and are afflicted by the collinearity of
+persistent line combinations (our T3). \textbf{Deep sequence models} of play-by-play data
+optimize predictive likelihood and inherit the deployment confound wholesale. Within the
+causal-ML taxonomy, our system is closest to an S-learner with an explicitly engineered
+adjustment set, wrapped in split-conformal inference; the novelty we claim is not any single
+component but the enforcement architecture binding them (C1--C4), which we have not seen
+deployed jointly in a production sports system.
+
+\section{Data Substrate and Forensic Repairs}\label{sec:data}
+
+\subsection{Perfect Windows: a contracted training surface}
+
+All modeling reads from a single table, \texttt{perfect\_windows\_v2} (6{,}490{,}872 rows;
+seasons 2018-19 through 2024-25; 5v5), assembled by joining audited sources and validated at
+build time against five machine-checked contracts:
+\begin{enumerate}[nosep]
+\item every player-performance feature is lagged and empirical-Bayes shrunk, and ships with
+its effective sample size $n_{\mathrm{eff}}$;
+\item every context feature is measurable at the window's opening faceoff (PRE-timing);
+\item people lists (\texttt{with\_ids}, \texttt{vs\_ids}) are fixed length $K{=}5$, sorted
+by co-presence seconds descending (a legacy system silently consumed \emph{unsorted} lists
+as if they were top-$K$; the raw sources are confirmed unsorted);
+\item baseline predictions are strictly out-of-fold, with fold provenance retained;
+\item outcome columns are targets and are refused as features by the validator.
+\end{enumerate}
+
+\subsection{Forensic findings}
+
+Three corruptions were found by the validation gate before any training run, in data that
+had already been used by predecessor systems:
+\begin{enumerate}[nosep]
+\item \textbf{Null outcomes.} The player-game observation file underlying all residual
+computation carried $y \equiv 0$ in every one of 761{,}823 rows --- a silently failed join.
+Every ``residual'' was $-\mu$. This retroactively explains the predecessor uncertainty
+model's 12\% empirical coverage at a nominal 80\% (its $\bar z = -1.87$ is exactly the
+missing-actuals artifact). Outcomes were rebuilt from per-game ground truth with a 100.0\%
+join rate across seven seasons.
+\item \textbf{Duplicate exposure.} The 10.29M-row window spine contained 1{,}491{,}039
+full-row duplicates spanning all eight seasons (a combine-step defect), double-counting
+exposure downstream; deduplication left zero key conflicts. The corruption had propagated
+into the out-of-fold prediction files ($12.9\%$ duplicate keys), which are now key-deduped
+at every load.
+\item \textbf{Global baseline miscalibration.} The environment baseline underpredicts
+on-ice xG by a season-dependent factor (mean residual $+0.9$ to $+1.9$ per 60). Rather than
+rescale the baseline (a label-aware operation with leakage risk), talent is defined
+\emph{league-relatively} by per-season demeaning (Section~\ref{sec:talent}), rendering the
+estimator invariant to any global miscalibration.
+\end{enumerate}
+
+\section{The Talent Prior}\label{sec:talent}
+
+\subsection{Construction}
+
+Let $r_{pg}$ denote player $p$'s game-$g$ on-ice xGF$^{60}$ residual against the
+out-of-fold, identity-blind environment baseline, demeaned within season $s(g)$ by the
+TOI-weighted league mean:
+\begin{equation}
+\tilde r_{pg} = r_{pg} - \frac{\sum_{q,h:\, s(h)=s(g)} w_{qh}\, r_{qh}}{\sum w_{qh}},
+\qquad w_{pg} = \text{TOI}_{pg}\ \text{(hours)} .
+\end{equation}
+Talent state ahead of any date $t$ is an exponentially decayed, \emph{lagged} running
+moment set with half-life $\lambda$ (default 40 games):
+\begin{equation}
+m_p(t) = \frac{\sum_{g: t_g < t} \rho^{\,\Delta(g,t)} w_{pg}\, \tilde r_{pg}}
+              {\sum_{g: t_g < t} \rho^{\,\Delta(g,t)} w_{pg}},
+\qquad
+n_p(t) = \sum_{g: t_g < t} \rho^{\,\Delta(g,t)} w_{pg},
+\qquad \rho = 2^{-1/\lambda},
+\end{equation}
+implemented so the state recorded at each game excludes that game (verified by unit test:
+the running-statistic recorder emits before ingesting). The served quantity is
+empirical-Bayes shrunk toward the league (zero, post-demeaning):
+\begin{equation}
+z_p(t) = \frac{n_p(t)}{n_p(t) + K}\; m_p(t),
+\qquad
+\widehat{\mathrm{se}}_p(t) = \max\!\left(\sqrt{v_p(t)/n_p(t)},\ \mathrm{se}_{\min}\right),
+\label{eq:shrink}
+\end{equation}
+with $K$ selected by out-of-time predictive risk over a grid (never hand-set) and a hard
+floor $\mathrm{se}_{\min}$ replacing a legacy pathology in which 89.6\% of low-$n$ rows
+carried a collapsed, identically zero standard error. Defensive talent uses $-\,$xGA
+residuals with the same machinery.
+
+\subsection{Face validity}
+
+On the first correctly computed residuals in the project's history, the untuned prior ranks
+McDavid first, Draisaitl second, and MacKinnon third among players with
+$n_{\mathrm{eff}} > 15$ TOI-hours, with Kucherov, Crosby (age 37), Makar, and Barzal in the
+top fifteen and Kucherov's \emph{defensive} component negative. We treat this as a
+necessary sanity property, not a result; the results are Section~\ref{sec:eval}.
+
+\section{The Environment Tower}\label{sec:tower}
+
+\subsection{Design principle: the focal player has no embedding}
+
+The predecessor encoder assigned every player a learned identity vector and then fought a
+counterintelligence war (gradient-reversal scrubbers, stream firewalls) to keep that vector
+from memorizing deployment and team. We remove the disease instead of treating it: the
+focal player enters the network only through $\big(z_p, \widehat{\mathrm{se}}_p,
+n_p\big)$ and explicit bio features (age, age$^2$, handedness, position). There is no
+lookup keyed on his identity, hence nothing to scrub. Teammates and opponents \emph{do}
+receive embeddings --- from the focal player's vantage point, other players are environment,
+and environment is precisely what the intervention swaps.
+
+\subsection{Architecture}
+
+Inputs are restricted to a frozen legal schema (Section~\ref{sec:legal}). Categorical
+context $c_w$ maps through embeddings; continuous team priors pass through a normalized
+linear block. The people payload is encoded by seconds-biased attention pooling: for
+teammate embeddings $u_1,\dots,u_K$ with co-presence seconds $s_1 \ge \dots \ge s_K$,
+\begin{equation}
+\alpha_k = \mathrm{softmax}_k\!\big( u_k^\top q + \log \max(s_k, 1) \big) \cdot
+\ind\{s_k > 0\},
+\qquad
+h_{\mathrm{with}} = \textstyle\sum_k \alpha_k u_k,
+\label{eq:setpool}
+\end{equation}
+and symmetrically for opponents. The tower output is
+$\henv = f_\theta\big(c_w, h_{\mathrm{with}}, h_{\mathrm{vs}}\big) \in \R^{256}$.
+Two training-time corruptions are integral to the design: \emph{teammate dropout}
+(random masking of WITH identities) prevents $\henv$ from fingerprinting the focal player
+through his habitual linemates and simultaneously matches the serving regime, where lineups
+are partially hypothesized; unseen identities at serving time resolve to pooled
+position$\times$role fallback vectors, with degradation under synthetic unknowns measured
+as an explicit test.
+
+\subsection{The legal input schema}\label{sec:legal}
+
+Every candidate feature was classified by a single criterion --- \emph{can the scenario
+builder reproduce it for a hypothetical destination from pre-$t_0$ information?} --- into
+\textsc{synth} (exactly constructible), \textsc{marg} (served as the destination slot's
+empirical distribution via bootstrap), or \textsc{banned}. Notable rulings, each traced to
+the generating code rather than inferred from names:
+\begin{itemize}[nosep]
+\item \texttt{matchup\_quality\_pct} --- \textsc{banned}. Traced construction: opponents'
+\emph{full-game} TOI percentile within role (includes post-window deployment, i.e.\ coach
+reactions to the game's own outcomes), weighted by \emph{realized within-window}
+head-to-head overlap seconds. Matchup difficulty reaches the tower legally through opponent
+identities and lagged opponent priors instead.
+\item \texttt{standing\_prior} --- \textsc{banned}. One code path selects standings rows
+with \texttt{after\_pk $\le$ current gamePk}, admitting the game's own result.
+\item \texttt{ai\_OZ\_start}, \texttt{ai\_DZ\_start} --- \textsc{allowed}. ``ai'' denotes
+\emph{after icing}: an icing-forced zone start, fully determined at the window's first
+second, and incidentally the cleanest deployment natural experiment hockey offers.
+\item All in-window shot-style counts and sums --- \textsc{banned} as outcomes wearing
+feature costumes, notwithstanding their (real) predictive value: the scenario builder can
+never supply them, so any accuracy they contribute is train/serve fiction.
+\end{itemize}
+The rulings compile to an \texttt{assert\_legal()} guard that refuses banned features at
+trainer construction, citing the trace in the raised error.
+
+\subsection{Acceptance probes}\label{sec:probes}
+
+A checkpoint ships only if a five-probe scorecard passes, all probes fit on held-out splits
+(the dry-run on random embeddings exposed in-sample probe overfitting --- $R^2 = 0.095$ on
+pure noise --- which would have flunked clean encoders; probes were repaired before first
+use and validated to refuse a random encoder, catch a synthetically leaky one, and pass a
+synthetically clean one):
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Probe & Readout from & Requirement & Rationale \\
+\midrule
+P1 & $\henv \to$ team identity & accuracy $< 3\times$ chance & env must not memorize employer \\
+P2 & $\henv \to$ focal OZ share & $R^2 < 0.10$ & env must not encode focal deployment \\
+P3 & $\henv$/talent $\to$ next-season ability & $R^2 > 0.30$ & the system retains real signal \\
+P4 & cross-season retrieval & top-5 $> 0.5$ & representations stable across years \\
+P5 & twin-distance ratio & $< 1.5$ & player moves must not fracture identity \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{The CIN Core}\label{sec:core}
+
+\subsection{Trunk}
+
+With $x = \big[\henv;\ \phi_z(z_p, \widehat{\mathrm{se}}_p, n_p);\ \phi_b(\mathrm{bio})\big]$
+projected to width $d{=}768$, the trunk applies $L{=}4$ pre-norm residual blocks with
+SwiGLU activation, each modulated by the lever vector through feature-wise linear
+modulation (FiLM):
+\begin{equation}
+\mathrm{Block}(h) = h + \mathrm{Drop}\Big(
+\big(1 + \tanh W_g \ell\big) \odot \mathrm{SwiGLU}\big(\mathrm{LN}(h)\big) + W_b \ell \Big).
+\end{equation}
+FiLM gives levers clean intervention semantics --- knobs modulate the computation rather
+than mixing additively with state --- and the talent channel $\phi_z$ is a separate pathway
+whose contribution the trunk cannot re-derive from deployment inputs (C2 made structural).
+
+\subsection{Heads and objective}
+
+Ten heads emit $(\mu_j, \log\sigma_j)$ per window. The per-head loss is heteroscedastic
+Gaussian NLL for the semi-continuous xG rates and Poisson-type likelihoods for count heads
+(goals, shots, microstatistics), exposure-offset by $\log(s_w/60)$; 68.8\% of windows carry
+$y_{\mathrm{xGF}} = 0$, and a homoscedastic Gaussian on that margin is misspecified.
+Cross-task weights are learned (Kendall--Gal):
+\begin{equation}
+\mathcal{L} = \sum_{j=1}^{10} e^{-\eta_j}\,
+\overline{\mathcal{L}_j}^{\,(\omega)} + \tfrac{1}{2}\eta_j ,
+\qquad
+\omega_w = \underbrace{s_w}_{\text{exposure}} \cdot
+\underbrace{\big(1 + (\kappa - 1)\,\ind\{g_w \le 10\}\big)}_{\text{switch weight (C3)},\ \kappa = 3},
+\end{equation}
+where $g_w$ counts games since the focal player's last team change: the loss concentrates
+on post-transition windows, the regime the product queries. Internal $\sigma_j$ are used
+for training and uncertainty \emph{ranking} only; they are contractually barred from
+human-facing intervals (Section~\ref{sec:conformal}). Training uses era-split checkpoints
+(strictly-before 2021/22/23/24) so that every backtested projection is freeze-legal, and a
+gradient-boosted twin trained on the identical legal features serves as a referee: the
+neural core does not ship unless it beats both the twin and the v0 estimator under the
+evaluation protocol of Section~\ref{sec:eval}.
+
+\section{Serving}\label{sec:serving}
+
+\subsection{Scenario construction and the v0 estimator}
+
+Given $(p, t_0, \text{destination}, \text{line})$, the builder identifies the slot
+incumbent by pre-$t_0$ TOI rank, bootstrap-resamples $N{=}2000$ of the incumbent's real
+pre-$t_0$ windows (preserving the joint distribution of context --- score states, zone
+starts, schedule --- rather than sampling marginals independently), overwrites the
+traveling-player block with $p$'s frozen talent and bio, and pins user-specified linemates
+into the WITH slots. The minimal estimator is then
+\begin{equation}
+\widehat{\mathrm{xGF}}^{60} = \E_{\hat{\mathcal{E}}'}\big[\mu^{\mathrm{OOF}}_{\mathrm{xGF}}\big] + z^{\mathrm{off}}_p(t_0),
+\qquad
+\widehat{\mathrm{xGA}}^{60} = \E_{\hat{\mathcal{E}}'}\big[\mu^{\mathrm{OOF}}_{\mathrm{xGA}}\big] - z^{\mathrm{def}}_p(t_0),
+\label{eq:v0}
+\end{equation}
+i.e.\ destination environment expectation plus transported talent --- explainable in one
+sentence and, per Section~\ref{sec:eval}, already sufficient to clear the industry baseline.
+The neural path (v1) replaces the first terms with trunk forward passes over the same
+synthetic windows, and is what makes linemate-level swaps and Tier-2 lever queries
+answerable at all: estimator~\eqref{eq:v0} is structurally blind to linemate identity.
+
+\subsection{Support gating}\label{sec:support}
+
+Queries are tiered. Tier~1 (environment swap): answered, subject to slot support
+($\ge 200$ real windows) and prior quality checks. Tier~2 (lever nudge): answered only
+within the focal archetype's observed lever range $[q_{05}, q_{95}]$ harvested from the
+validated lever-sweep corpus. Tier~3: the engine returns a refusal object,
+\texttt{REFUSED\_OOS}, never a number. Refusal-as-output is, in our view, the single
+clearest behavioral difference between causal inference as engineering and as branding.
+
+\subsection{Conformal calibration}\label{sec:conformal}
+
+Intervals come from split-conformal inference on the \emph{intervention population}: signed
+errors of frozen-at-$t_0$ projections on the historical ledger, binned by talent
+$n_{\mathrm{eff}}$, with the standard exchangeability-based marginal coverage guarantee
+within bins. Every emitted interval carries its bin's \emph{achieved} coverage; emission
+without it is a contract violation. Current global figures: nominal 80\%, achieved 79.8\%.
+The predecessor system's internal-variance intervals achieved 12\% at the same nominal
+level --- the difference between modeled and measured uncertainty is the credibility of the
+entire product.
+
+\section{Evaluation}\label{sec:eval}
+
+\subsection{Protocol}
+
+The ledger comprises every player--team transition 2021--2025 detected in our own data
+(teamId change across consecutive appearances), qualified at $\ge 1000$ career 5v5 minutes
+pre-move and $\ge 20$ GP post-move: 729 moves (196 in-season trades, 533 off-season).
+For each move, the world is frozen at $t_0$: talent snapshot, destination templates, and
+baselines all read strictly pre-$t_0$ data (era-split models for any learned component).
+The target is realized on-ice xGF\% over the first 40 post-move games. An executable
+leakage audit re-runs sampled moves with post-$t_0$ rows physically deleted and asserts
+bit-identical projections. Baselines: last-season carryover; Marcel (5/4/3 season weights,
+regression to league mean by minutes, age adjustment); and Marcel plus half the
+team-quality delta (the strawman a hostile reviewer proposes).
+
+\subsection{Results}
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Projector & RMSE (xGF\%, first 40 GP) & $\Delta$ vs.\ Marcel & 95\% CI on $\Delta$ \\
+\midrule
+Last-season carryover & 7.47 & $+1.67$ & --- \\
+Marcel & 5.80 & --- & --- \\
+\textbf{CIN v0 (this work)} & \textbf{5.30} & $\mathbf{-0.50}$ ($-8.6\%$) & $[-0.67,\, -0.33]$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent $n = 635$ scoreable moves; the confidence interval is a 10{,}000-resample
+bootstrap of the paired RMSE difference and excludes zero by a wide margin. Sliced by move
+type, v0 attains 5.14 on in-season trades versus 5.37 on off-season moves --- the system is
+\emph{strongest} on the natural experiments closest to its identification story, and to the
+customer's pain. Emitted 80\% intervals achieve 79.8\% coverage; interval half-widths
+($\approx \pm 6.6$ points) are wide and honest, dominated by the sampling noise floor of a
+40-game on-ice share ($\approx$3--4 points), which no projector can beat and which we
+disclose rather than obscure. The v0 result is a floor in a second sense: the estimator
+uses one scalar per player per side and an environment \emph{average}; the neural core
+exists to convert linemate identity and lever structure into margin beyond $-8.6\%$, and
+ships only if it does (Section~\ref{sec:core}).
+
+\section{Threat Model}\label{sec:threats}
+
+The complete 18-item audit (deployment confounding; talent--residual circularity; linemate
+collinearity; ledger survivorship at the $\ge$20-GP filter, a collider whose bias applies
+symmetrically to all compared projectors; acquisition selection-on-fit; injury
+unobservables; role-assignment error; regression to the mean; era drift and short seasons;
+goaltender contamination of defensive signal; score-state effects; out-of-support
+extrapolation; the sampling noise floor; the three data corruptions of
+Section~\ref{sec:data}; baseline integrity; deadline-context shift; cold-start prior
+degeneracy; and uncertainty miscalibration) is maintained in the repository README with a
+disposition for each: \textsc{solved} structurally, \textsc{priced} into conformal
+intervals, \textsc{gated} at the API, or \textsc{open} with scheduled work. The
+methodological stance is uniform: no threat is argued away; each is closed, measured, or
+refused.
+
+\section{Limitations and Ongoing Work}
+
+(i) The scalar talent prior cannot express \emph{fit} --- complementarities between player
+styles; v1 adds a low-dimensional, probe-gated style vector on the talent side, computed
+from pre-$t_0$ windows only. (ii) The talent--outcome loop is one-step EM; iterating with
+talent-aware refits is scheduled once the v1 harness exists. (iii) Shrinkage constant $K$
+selected at the grid boundary under a per-game criterion; refit against next-season
+aggregates is queued. (iv) Sensitivity of the headline to the survivorship filter
+($\ge$10~GP variant) and to residual duplicate effects in legacy $\mu$ aggregation are
+scheduled re-runs. (v) The league-translation layer for AHL/ECHL projection --- the
+commercial extension --- is an exercise in data acquisition on this architecture, not new
+methodology: the query class is identical.
+
+\section*{Reproducibility}
+
+The system is a single contracted repository (validation gate, executable schemas,
+era-split training protocol, freeze-audited backtest, hash-sealed forward predictions at
+\texttt{seal/}); every number in this report is regenerated by numbered pipeline scripts
+\texttt{00}--\texttt{06} from raw sources, and forward projections for the 2026-27 season
+are frozen and SHA-256--sealed before puck drop, to be scored publicly.
+
+\end{document}
