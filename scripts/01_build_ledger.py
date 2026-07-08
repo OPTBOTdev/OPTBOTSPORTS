@@ -17,7 +17,7 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from optbot.data.ledger import qualify, COLUMNS  # noqa: E402
+from optbot.data.ledger import qualify  # noqa: E402
 
 SPINE = r"D:\optbot\artifacts\window_spine_dedup.parquet"
 OBS = r"D:\optbot\artifacts\player_game_obs_rebuilt.parquet"

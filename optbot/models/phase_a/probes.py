@@ -16,7 +16,8 @@ import numpy as np
 
 
 def _ridge_r2(X, y, lam=1e-2):
-    X = np.asarray(X, dtype=np.float64); y = np.asarray(y, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
     mask = np.isfinite(y)
     X, y = X[mask], y[mask]
     Xb = np.c_[X, np.ones(len(X))]
@@ -49,7 +50,8 @@ def scorecard(emb: np.ndarray, meta, next_emb=None, next_meta=None) -> dict:
         a = emb / np.linalg.norm(emb, axis=1, keepdims=True)
         b = next_emb / np.linalg.norm(next_emb, axis=1, keepdims=True)
         sim = a @ b.T
-        ids_a = meta["playerId"].values; ids_b = next_meta["playerId"].values
+        ids_a = meta["playerId"].values
+        ids_b = next_meta["playerId"].values
         match = ids_a[:, None] == ids_b[None, :]
         rank_hit = []
         for i in range(len(a)):
@@ -59,8 +61,6 @@ def scorecard(emb: np.ndarray, meta, next_emb=None, next_meta=None) -> dict:
         out["P4_retrieval_top5"] = float(np.mean(rank_hit)) if rank_hit else np.nan
         out["P4_pass"] = out["P4_retrieval_top5"] > 0.5
 
-        moved = meta["playerId"].isin(next_meta.loc[~next_meta["teamId"].values.__eq__(
-            None), "playerId"])  # players present both seasons
         # twin ratio: same-player-cross-team distance / same-player-same-team distance
         d_cross, d_same = [], []
         for i in range(len(a)):

@@ -17,7 +17,8 @@ if __name__ == "__main__":
     cfg = yaml.safe_load(open(args.config))
     results = run_all(cfg)
     ok = print_report(results)
-    out = Path(cfg["paths"]["out_dir"]); out.mkdir(parents=True, exist_ok=True)
+    out = Path(cfg["paths"]["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
     with open(out / "data_validation_report.json", "w") as f:
         json.dump(results, f, indent=2)
     sys.exit(0 if ok else 1)

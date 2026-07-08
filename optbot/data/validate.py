@@ -10,8 +10,6 @@ Each check returns (name, PASS/WARN/FAIL, detail). FAILs block the pipeline.
 """
 from __future__ import annotations
 import glob
-import json
-import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 

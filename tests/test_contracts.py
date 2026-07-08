@@ -17,7 +17,6 @@ def test_outcomes_never_in_features():
 
 
 def test_prior_naming_contract():
-    import re
     for c in ws.PRIORS:
         if c in ws._BIO:
             continue

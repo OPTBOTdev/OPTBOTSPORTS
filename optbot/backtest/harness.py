@@ -94,7 +94,8 @@ def audit_freeze(ledger, obs, windows, lines, asof_talent, K_minutes, n=5, seed=
     rng = np.random.default_rng(seed)
     sample = ledger.sample(min(n, len(ledger)), random_state=int(rng.integers(1 << 31)))
     full = run(sample, obs, windows, lines, asof_talent, K_minutes)
-    obs_cut = obs.copy(); win_cut = windows.copy()
+    obs_cut = obs.copy()
+    win_cut = windows.copy()
     results = []
     for mv in sample.itertuples():
         t0 = mv.move_date

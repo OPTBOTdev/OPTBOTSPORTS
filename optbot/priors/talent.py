@@ -28,7 +28,9 @@ def _decayed_running(df: pd.DataFrame, value_col: str, weight_col: str,
     """Per player: lagged decayed mean/var/n_eff as-of each game date (value at row i
     excludes game i). df must be sorted by (playerId, date)."""
     lam = 0.5 ** (1.0 / half_life_games)
-    out_mean = np.empty(len(df)); out_var = np.empty(len(df)); out_neff = np.empty(len(df))
+    out_mean = np.empty(len(df))
+    out_var = np.empty(len(df))
+    out_neff = np.empty(len(df))
     for _, idx in df.groupby("playerId", sort=False).indices.items():
         sw = swx = swx2 = 0.0
         for i in idx:  # idx is positional & date-ordered
@@ -43,7 +45,9 @@ def _decayed_running(df: pd.DataFrame, value_col: str, weight_col: str,
                 swx = lam * swx + w * x
                 swx2 = lam * swx2 + w * x * x
             else:
-                sw *= lam; swx *= lam; swx2 *= lam
+                sw *= lam
+                swx *= lam
+                swx2 *= lam
     return pd.DataFrame({"raw": out_mean, "var": out_var, "n_eff": out_neff}, index=df.index)
 
 

@@ -47,7 +47,8 @@ def project(obs: pd.DataFrame, player_id: int, t0: str,
     xga = a * xga + (1 - a) * league_xga
     if age is not None:                       # mild symmetric age curve
         adj = -0.008 * max(age - age_knot, 0) + 0.004 * max(age_knot - age, 0)
-        xgf *= (1 + adj); xga *= (1 - adj / 2)
+        xgf *= (1 + adj)
+        xga *= (1 - adj / 2)
     return {"xgf60": xgf, "xga60": xga,
             "xgf_pct": 100 * xgf / (xgf + xga), "basis": f"{len(mine)}season"}
 

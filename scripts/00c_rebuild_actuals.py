@@ -19,7 +19,6 @@ import glob
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 SEASON_DIRS = {  # season label -> game-files dir  (2017 lives in 2017_Final)

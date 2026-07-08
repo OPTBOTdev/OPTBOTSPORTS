@@ -50,9 +50,10 @@ class PhaseAv2(nn.Module):
         self.with_pool, self.vs_pool = SetPool(d), SetPool(d)
         self.pid_proj = nn.Linear(96, d)
         self.type_emb = nn.Embedding(ID_TOKENS + CTX_TOKENS, d)
-        enc = lambda n: nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d, heads, d * 4, 0.1, "gelu",
-                                       batch_first=True, norm_first=True), n)
+        def enc(n):
+            return nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d, heads, d * 4, 0.1, "gelu",
+                                           batch_first=True, norm_first=True), n)
         self.id_enc, self.ctx_enc = enc(id_layers), enc(ctx_layers)
         self.firewall = nn.MultiheadAttention(d, heads, batch_first=True)
         self.role_gate = nn.Parameter(torch.tensor(-2.0))     # sigmoid*0.3 cap

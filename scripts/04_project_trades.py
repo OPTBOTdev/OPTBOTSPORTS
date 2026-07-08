@@ -42,7 +42,8 @@ if __name__ == "__main__":
     p["support"] = verdict.__dict__
     try:
         cb_state = json.loads((ART / "conformal_bands.json").read_text())
-        cb = ConformalBands(); cb.q_ = {int(k): tuple(v) for k, v in cb_state["q"].items()}
+        cb = ConformalBands()
+        cb.q_ = {int(k): tuple(v) for k, v in cb_state["q"].items()}
         cb.coverage_ = {int(k): v for k, v in cb_state["coverage"].items()}
         cb.edges = cb_state["edges"]
         p["band80"] = cb.band(p["xgf_pct"], p["talent_n_eff"])

@@ -42,5 +42,7 @@ if __name__ == "__main__":
 
     vets = snap[snap.talent_n_eff > 15].sort_values("talent_off_shrunk")
     print("=== SNIFF TEST (talent_off_shrunk, n_eff>15h) ===")
-    print("TOP 15:");    print(vets.tail(15).iloc[::-1].to_string(index=False))
-    print("BOTTOM 15:"); print(vets.head(15).to_string(index=False))
+    print("TOP 15:")
+    print(vets.tail(15).iloc[::-1].to_string(index=False))
+    print("BOTTOM 15:")
+    print(vets.head(15).to_string(index=False))

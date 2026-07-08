@@ -13,7 +13,6 @@ Every build ends with contracts.window_schema.validate() — failure aborts the 
 from __future__ import annotations
 import glob
 
-import numpy as np
 import pandas as pd
 
 from ..contracts import window_schema as ws
