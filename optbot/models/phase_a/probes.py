@@ -15,23 +15,33 @@ from __future__ import annotations
 import numpy as np
 
 
+def _split(n, seed=0):
+    idx = np.random.default_rng(seed).permutation(n)
+    return idx[: n // 2], idx[n // 2:]
+
+
 def _ridge_r2(X, y, lam=1e-2):
+    """HELD-OUT R2 — in-sample probing overfits (d~emb_dim vs n~players) and
+    would flunk clean encoders / pass leaky ones. Caught by the random dry-run."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     mask = np.isfinite(y)
     X, y = X[mask], y[mask]
+    tr, te = _split(len(y))
     Xb = np.c_[X, np.ones(len(X))]
-    w = np.linalg.solve(Xb.T @ Xb + lam * np.eye(Xb.shape[1]), Xb.T @ y)
-    resid = y - Xb @ w
-    return 1 - resid.var() / max(y.var(), 1e-12)
+    w = np.linalg.solve(Xb[tr].T @ Xb[tr] + lam * np.eye(Xb.shape[1]), Xb[tr].T @ y[tr])
+    resid = y[te] - Xb[te] @ w
+    return float(1 - resid.var() / max(y[te].var(), 1e-12))
 
 
 def _linear_probe_acc(X, labels, lam=1e-2):
+    """Held-out accuracy (same rationale as _ridge_r2)."""
     classes, y = np.unique(labels, return_inverse=True)
     Y = np.eye(len(classes))[y]
-    Xb = np.c_[X, np.ones(len(X))]
-    W = np.linalg.solve(Xb.T @ Xb + lam * np.eye(Xb.shape[1]), Xb.T @ Y)
-    return float((np.argmax(Xb @ W, 1) == y).mean()), 1.0 / len(classes)
+    Xb = np.c_[np.asarray(X, dtype=np.float64), np.ones(len(y))]
+    tr, te = _split(len(y))
+    W = np.linalg.solve(Xb[tr].T @ Xb[tr] + lam * np.eye(Xb.shape[1]), Xb[tr].T @ Y[tr])
+    return float((np.argmax(Xb[te] @ W, 1) == y[te]).mean()), 1.0 / len(classes)
 
 
 def scorecard(emb: np.ndarray, meta, next_emb=None, next_meta=None) -> dict:
