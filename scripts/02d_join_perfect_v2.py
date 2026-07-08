@@ -1,7 +1,6 @@
 """Perfect Windows v2: join people payload + window outcomes onto v1.
 Drops 2017-18 (no extraction source, no talent obs). Validates the completed blocks.
 """
-import sys
 from pathlib import Path
 
 import numpy as np
