@@ -46,6 +46,7 @@ if __name__ == "__main__":
         print(bt.groupby(col).apply(
             lambda g: ((g.pred_v0 - g.actual_xgf_pct) ** 2).mean() ** 0.5).round(2))
 
-    bands = ConformalBands(target=0.80).fit(bt.dropna(subset=["pred_v0"]))
+    bands = ConformalBands(target=0.80).fit(bt.dropna(subset=["pred_v0"]),
+                                            pred_col="pred_v0")
     bands.save(str(ART / "conformal_bands.json"))
     print("\nconformal bands per n_eff bin (achieved coverage):", bands.coverage_)

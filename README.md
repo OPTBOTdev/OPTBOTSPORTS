@@ -272,8 +272,9 @@ Pipeline (each script gated by the previous):
 | Trade/UFA ledger | ✅ BUILT | 729 qualifying moves (196 trades, 533 offseason) |
 | The bar (Marcel) | ✅ MEASURED | **RMSE 5.67 xGF%** (carryover: 7.40) on all 729 |
 | Perfect windows + lines | ✅ BUILT | 7.52M rows, 0 dup keys, 100% mu & line coverage |
-| **Backtest: v0 vs the bar** | 🔄 RUNNING | 729 frozen-clock projections + 10k bootstrap |
-| Conformal bands (T18 replacement) | 🔄 with backtest | coverage report auto-attached |
+| **Backtest: v0 vs the bar** | ✅ **CLAIM PROVEN** | **RMSE 5.30 vs Marcel 5.80 (−8.6%), 95% CI [−0.67, −0.33] — clear of zero, n=635** |
+| — sliced by move type | ✅ | trades 5.14 · offseason 5.37 — strongest on in-season trades |
+| Conformal bands (T18 replacement) | ✅ CALIBRATED | **79.8% achieved at 80% target** (vs legacy Kalman's 12%) |
 | K refit vs next-season aggregates | ⏳ NEXT | current fit hit grid edge — noisy per-game target |
 | Obs-mu recompute on deduped windows | ⏳ NEXT | residual T14 item |
 | Environment tower + CIN trunk training | ⏳ GPU QUEUED | trainers spec'd; era-split protocol defined |
@@ -281,7 +282,7 @@ Pipeline (each script gated by the previous):
 
 ## 6. Honest risk register (what we tell investors before they ask)
 
-1. If v0 does not clear Marcel with CI room, the MVP claim narrows to the slices where it does (in-season trades are the likeliest win) — the harness exists precisely to learn this in July, not in a meeting.
+1. ~~If v0 does not clear Marcel with CI room, the claim narrows~~ — **resolved July 8: v0 cleared the bar with the full CI below zero.** The residual version of this risk: the margin (−8.6%) must survive the scheduled sensitivity re-runs (≥10 GP filter, K refit, obs-mu recompute).
 2. The noise floor bounds every promise: we sell *calibrated* foresight, never certainty.
 3. The neural CIN is upside, not dependency: v0 runs on audited statistics end to end.
 4. AHL/ECHL extension is an architecture-ready data acquisition, not a research bet — the same swap query with a league-translation layer, which is exactly what partner data funds.

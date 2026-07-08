@@ -59,9 +59,10 @@ def build_windows(sc: Scenario, windows: pd.DataFrame, lines: pd.DataFrame,
     with the traveling-player block overwritten."""
     rng = np.random.default_rng(rng_seed)
     incumbent = slot_incumbent(windows, sc.dest_team, sc.line_no, sc.as_of_date, lines)
+    # perfect_windows is already strength-filtered at build time (strength_norm);
+    # do NOT filter on raw strength_global here — label drift ('5V5_5v5') burned us once.
     slot = windows[(windows.playerId == incumbent) & (windows.teamId == sc.dest_team)
-                   & (windows.date < sc.as_of_date)
-                   & (windows.strength_global == "5v5")]
+                   & (windows.date < sc.as_of_date)]
     if len(slot) < 200:
         raise ValueError(f"slot support too thin: {len(slot)} windows for incumbent {incumbent}")
 

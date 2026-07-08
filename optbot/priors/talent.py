@@ -31,6 +31,8 @@ def _decayed_running(df: pd.DataFrame, value_col: str, weight_col: str,
     out_mean = np.empty(len(df))
     out_var = np.empty(len(df))
     out_neff = np.empty(len(df))
+    vals = df[value_col].to_numpy(dtype=float)      # hoisted: no per-row fetch
+    wts = df[weight_col].to_numpy(dtype=float)
     for _, idx in df.groupby("playerId", sort=False).indices.items():
         sw = swx = swx2 = 0.0
         for i in idx:  # idx is positional & date-ordered
@@ -38,8 +40,8 @@ def _decayed_running(df: pd.DataFrame, value_col: str, weight_col: str,
             out_neff[i] = sw
             out_mean[i] = swx / sw if sw > 0 else np.nan
             out_var[i] = max(swx2 / sw - (swx / sw) ** 2, 0.0) if sw > 0 else np.nan
-            w = df[weight_col].values[i]
-            x = df[value_col].values[i]
+            w = wts[i]
+            x = vals[i]
             if np.isfinite(x) and w > 0:
                 sw = lam * sw + w
                 swx = lam * swx + w * x

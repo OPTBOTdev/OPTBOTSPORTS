@@ -32,16 +32,33 @@ def games_since_team_change(spine: pd.DataFrame) -> pd.Series:
     return g[["playerId", "gamePk"]].assign(games_since_team_change=since.values)
 
 
+SPINE_COLS = [  # trimmed load — full 59-col spine is unnecessary for v0
+    "season", "gamePk", "window_id", "teamId", "playerId", "date",
+    "strength_global", "seconds", "duration",
+    "period", "period_time_bucket", "score_bucket", "start_regime",
+    "lever_zone_start", "fo_loc_enum", "stoppage_class_at_start",
+    "after_icing", "bench_rights", "long_change", "home_away", "rinkid",
+    "skater_diff", "opponent_teamId_start", "n_eff_games_team",
+    "team_xgf60_prior_ev", "team_xga60_prior_ev", "team_pace60_ev_prior",
+    "opp_team_xgf60_prior_ev", "opp_team_xga60_prior_ev", "opp_team_pace60_ev_prior",
+    "team_gsaa_per60_prior_eb", "opp_gsaa_per60_prior_eb",
+    "team_goalie_tier", "opp_goalie_tier",
+]
+
+
 def build(spine_path: str, baseline_glob: str, talent_asof_path: str,
           lines_path: str, out_path: str, strength: str = "5v5") -> dict:
-    spine = pd.read_parquet(spine_path)
+    spine = pd.read_parquet(spine_path, columns=SPINE_COLS)
     spine["strength_norm"] = _norm_strength(spine["strength_global"])
     spine = spine[spine.strength_norm == strength]
 
-    mu = pd.concat([pd.read_parquet(f, columns=[
-        "season", "gamePk", "window_id", "teamId", "playerId",
-        "mu_xgf60", "mu_xga60", "sigma_xgf_w", "sigma_xga_w"])
-        for f in sorted(glob.glob(baseline_glob))], ignore_index=True)
+    KEYS = ["season", "gamePk", "window_id", "teamId", "playerId"]
+    mu = pd.concat([pd.read_parquet(f, columns=KEYS +
+                                    ["mu_xgf60", "mu_xga60", "sigma_xgf_w", "sigma_xga_w"])
+                    for f in sorted(glob.glob(baseline_glob))], ignore_index=True)
+    # the mu files were generated from the pre-dedupe spine and carry the same
+    # ~13% duplicate rows — drop on keys or the left-join inflates exposure
+    mu = mu.drop_duplicates(subset=KEYS)
     df = spine.merge(mu, on=["season", "gamePk", "window_id", "teamId", "playerId"],
                      how="left")
 

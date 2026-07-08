@@ -83,7 +83,7 @@ def headline(bt: pd.DataFrame, n_boot: int = 10_000, seed: int = 0) -> dict:
     lo, hi = np.percentile(deltas, [2.5, 97.5])
     out["delta_rmse_v0_vs_marcel"] = out["rmse_v0"] - out["rmse_marcel"]
     out["delta_ci95"] = [float(lo), float(hi)]
-    out["claim_ok"] = hi < 0
+    out["claim_ok"] = bool(hi < 0)
     out["pct_improvement"] = 100 * (1 - out["rmse_v0"] / out["rmse_marcel"])
     return out
 
