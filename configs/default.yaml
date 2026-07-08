@@ -1,0 +1,41 @@
+# Single source of truth for paths + core hyperparameters.
+paths:
+  window_spine: "D:/combined_player_windows_2017_2024.parquet"
+  baseline_dir: "D:/baseline_model_output"
+  player_game_obs: "D:/baseline_model_output/phaseC_player_game_observations.parquet"
+  player_windows_baseline_glob: "D:/baseline_model_output/player_windows_with_baseline_*.parquet"
+  phaseB_train: "D:/phaseB/phaseB_ev_train_2017_2022.parquet"
+  lever_curves_global: "D:/phaseB/lever_curves_global"
+  out_dir: "D:/optbot/artifacts"
+
+mvp:
+  strength: "5v5"
+  horizon_games: 40
+  min_career_5v5_minutes: 1000     # ledger inclusion
+  min_post_move_gp: 20             # ledger inclusion
+
+talent_prior:
+  half_life_games: 40              # exponential decay on game recency
+  k_grid: [500, 1000, 1500, 2000, 3000, 4500]   # EB shrinkage constants to fit
+  fit_metric: "next_season_mse"    # choose K by out-of-time prediction
+  se_floor: 0.15                   # NEVER emit SE below this (cold-start fix)
+
+marcel:
+  season_weights: [5, 4, 3]
+  regression_minutes: 2400         # minutes of league-mean added
+  age_curve_knot: 27
+
+conformal:
+  target_coverage: 0.80
+  n_eff_bins: [0, 1500, 3000, 999999]
+
+switch_weighting:                  # C3
+  post_switch_games: 10
+  weight: 3.0
+
+phase_b:
+  width: 768
+  depth: 4
+  ablate_big: {width: 1536, depth: 8}
+  heads: [xGF, xGA, GF, GA, SF, SA, hits, blocks, takeaways, giveaways]
+  era_splits: [2021, 2022, 2023, 2024]   # train strictly-before each

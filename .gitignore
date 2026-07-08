@@ -1,0 +1,22 @@
+# data & artifacts NEVER go to the repo — paths live in configs/default.yaml
+artifacts/
+*.parquet
+*.pt
+*.joblib
+*.ckpt
+*.csv
+!data/ledger_manual.csv
+!data/movers_2026.csv
+
+# python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# local
+*.log
+.DS_Store
+Thumbs.db
