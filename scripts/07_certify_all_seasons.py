@@ -20,7 +20,8 @@ if __name__ == "__main__":
                              usecols=["game_id", "goal", "homeSkatersOnIce",
                                       "awaySkatersOnIce", "xGoal"])
         except FileNotFoundError:
-            print(f"{season}: no shots file"); continue
+            print(f"{season}: no shots file")
+            continue
         sh5 = sh[(sh.homeSkatersOnIce == 5) & (sh.awaySkatersOnIce == 5)]
         w = pw[pw.season == season].copy()
         w["mp_id"] = w.gamePk - (yr * 1_000_000 + 0)  # e.g. 2024020001 - 2024000000
