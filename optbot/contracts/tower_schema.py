@@ -26,10 +26,14 @@ SYNTH_TEAM_PRIORS = [
 SYNTH_PEOPLE = ["with_ids", "with_seconds", "vs_ids", "vs_seconds"]  # the intervention
 
 # ---- MARG: served as slot-bootstrap distributions, never point-known -------
+# ENTRY-side timing is legal context (a coach's decision, made before the focal
+# exposure begins): captures 'inserted late / mid-chaos / post-icing rescue'
+# situational structure. 100% populated in source; 37% of rows enter mid-window.
 MARG = [
     "seconds", "duration",                    # exposure (loss weights / offsets)
     "shift_count_in_window", "time_since_last_shift_s", "last_shift_len_s",
     "onice_elapsed_at_window_start", "entered_after_start", "entry_offset_s",
+    "stint_duration_max", "is_multistint",    # blended-row flag: trainer downweights
 ]
 
 # ---- BANNED (with reasons — cite these when someone asks) ------------------
@@ -45,6 +49,12 @@ BANNED = {
     "__focal_id__": "focal player has NO embedding — talent channel only (C2)",
     "__focal_deployment_priors__": "p_prior_oz_share etc. describe OLD-team usage; "
                                    "destination role template supplies deployment",
+    # EXIT-side timing is a consequence, not a decision: players leave early
+    # BECAUSE of what happened (goal against -> change; trapped -> whistle).
+    # Partially outcome-caused => banned. Entry-side stays legal (see MARG).
+    "exited_before_end": "exit timing is outcome-contaminated",
+    "exit_offset_s": "exit timing is outcome-contaminated",
+    "stint_duration_st": "realized within-window stint variance — outcome-adjacent",
 }
 
 TOWER_INPUTS = SYNTH_CONTEXT + SYNTH_SCHEDULE + SYNTH_TEAM_PRIORS + SYNTH_PEOPLE + MARG
