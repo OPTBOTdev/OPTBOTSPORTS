@@ -52,12 +52,14 @@ def assemble(seasons):
                        on=["gamePk", "window_id", "playerId"], how="left")
         mp_cols = [c for c in m.columns if c.startswith("mp_")]
         m[mp_cols] = m[mp_cols].fillna(0.0)
-        # entry-context + multistint from extended extraction
-        extra = po[po.season == season][
-            ["gamePk", "window_id", "playerId", "is_multistint",
-             "entered_after_start", "entry_offset_s",
-             "onice_elapsed_at_window_start", "time_since_last_shift_s"]]
-        m = m.merge(extra, on=["gamePk", "window_id", "playerId"], how="left")
+        # entry-context + multistint: only merge cols v2 doesn't already carry
+        want = ["is_multistint", "entered_after_start", "entry_offset_s",
+                "onice_elapsed_at_window_start", "time_since_last_shift_s"]
+        need = [c for c in want if c not in m.columns]
+        if need:
+            extra = po[po.season == season][
+                ["gamePk", "window_id", "playerId"] + need]
+            m = m.merge(extra, on=["gamePk", "window_id", "playerId"], how="left")
         frames.append(m)
         print(f"{season}: {len(m):,} rows assembled "
               f"({m.mp_xgf.gt(0).mean():.1%} rows with mp_xgf>0)")
@@ -84,11 +86,20 @@ def audit(v3: pd.DataFrame):
         shots = glob.glob(str(ART / f"mp_attach_{yr}" / "mp_shots_*.parquet"))
         if not shots:
             continue
-        shot_xg = sum(pd.read_parquet(f).xGoal.sum() for f in shots)
+        # denominator scoped to shots attached to windows PRESENT in v3 (5v5):
+        # attach covered {5v5,PP,PK}; v3 is 5v5-only, so unscoped ratio reads
+        # 5 x (5v5 xG share) ~= 3.65 — verified consistent across seasons.
+        wids = set(map(tuple, v3.loc[v3.season == season,
+                                     ["gamePk", "window_id"]].values))
+        shot_xg = 0.0
+        for f in shots:
+            s = pd.read_parquet(f, columns=["gamePk", "window_id", "xGoal"])
+            s = s[[tuple(x) in wids for x in s[["gamePk", "window_id"]].values]]
+            shot_xg += float(s.xGoal.sum())
         pw_xg = v3.loc[v3.season == season, "mp_xgf"].sum()
         ratio = pw_xg / max(shot_xg, 1e-9)
         flag = "PASS" if 4.5 <= ratio <= 5.5 else "INVESTIGATE"
-        print(f"A2 {season}: player-credit/shot ratio {ratio:.2f} (expect ~5) {flag}")
+        print(f"A2 {season}: 5v5-scoped credit/shot ratio {ratio:.2f} (expect ~5) {flag}")
 
     # A3 cross-model per-window correlation
     m = v3[(v3.mp_xgf > 0) | (v3.y_xGF > 0)]
