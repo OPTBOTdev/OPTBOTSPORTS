@@ -1,1139 +1,745 @@
-import argparse
-import csv
-import json
-import math
-import os
-import re
-import datetime
-import urllib.request
-import urllib.error
-import bisect
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+#!/usr/bin/env python3
 """
-perfect_windows.py (TOKENS ONLY, CSV ONLY)
-
-This script builds:
-- Window *containers* (same segmentation concept as before): contiguous time spans in seconds, bounded by
-  stoppages / faceoffs / goals / penalties / challenges / timeouts / strength changes / hard caps / period end.
-  These containers are NOT the modeling unit; they are only the parent structure.
-
-- Player *tokens* inside each container: a token is a decision-time snapshot for a specific player, predicting
-  what happens NEXT over a fixed horizon. Tokens are allowed to overlap; they are NOT additive and should not
-  be used to reconstruct the container.
-
-Outputs (CSV-only):
-- windows_{gamePk}.csv
-- player_tokens_{gamePk}.csv
-
-Token row key (primary):
-  (season, date, gamePk, teamId, strength_global, window_id, playerId, token_idx)
-
-Train vs Sim feature namespaces:
-- sim_* columns: mechanistic / known-in-sim variables at t_token (time, strength, score, roster IDs, goalie IDs, etc.)
-- train_* columns: may include richer observed-world history up to t_token (currently a small superset)
-  NOTE: both namespaces are flattened into CSV columns.
+Team + Player-aware training windows (JSON-in -> windows.json, team_windows.json, player_windows.json/CSV)
+[... docstring unchanged for brevity ...]
 """
 
+from __future__ import annotations
+import argparse, json, os, math, re, glob
+from collections import defaultdict, Counter
+from typing import Any, Dict, List, Tuple, Optional
+
+# Globals set by CLI (main) so helper functions can access input/standings dirs
+CLI_IN_PATH: Optional[str] = None
+CLI_STANDINGS_DIR: Optional[str] = None
 
 # -------------------- Constants --------------------
+SECONDS_PER_PERIOD = 20 * 60
+MAX_SECONDS        = SECONDS_PER_PERIOD * 6  # safety ceiling
 
-SECONDS_PER_PERIOD = 1200
+NATURAL_BREAK_TYPES = {
+    "faceoff","goal","penalty","offside","icing","stoppage",
+    "puck-out-of-play","goalie-stopped","timeout","challenge"
+}
 
-SHOT_ON_GOAL_TYPES = {"shot-on-goal"}
-GOAL_TYPES = {"goal"}
-MISS_TYPES = {"missed-shot"}
-BLOCK_TYPES = {"blocked-shot"}
-SHOT_TYPES = SHOT_ON_GOAL_TYPES | MISS_TYPES | BLOCK_TYPES
+# chemistry thresholds (adaptive)
+SEC_FLOOR_BASE   = 5
+RAW_SHARE_MIN    = 0.0225
+SHORT_WIN_SEC    = 10
+SHORT_SHARE_MIN  = 0.40
+SHORT_SEC_FRAC   = 0.50
+TOPK_FALLBACK    = 1
 
-MICRO_TYPES = {"giveaway", "takeaway", "hit", "blocked-shot"}
-ZONE_BUCKETS = ("OZ", "NZ", "DZ")
+EA_PRUNE_MIN     = 6
 
-TOKEN_PRIORITIES = {"WINDOW_START": 0, "ENTRY": 1, "STATE": 2, "EXIT": 3}
+# Edge cameo drop rule
+EDGE_CAMEO_SEC          = 5
+DROP_PLAYER_EDGE_ROWS   = True
 
-# Selection/termination supervision tokens:
-ANCHOR_TOKEN_TYPES = {"ENTRY", "EXIT", "WINDOW_START"}
-# Outcome supervision can be attached to any token row that coincides with a state-run start.
-# Practically:
-# - Mid-shift state starts use token_type=STATE
-# - If a state starts at ENTRY or WINDOW_START, we merge them into a single row (token_type remains ENTRY/WINDOW_START)
-#   and set is_outcome_token=1.
-OUTCOME_TOKEN_TYPES = {"STATE"}  # kept for backwards compatibility / readability
+# What counts as a "useful event" for protecting a ≤3s edge cameo?
+# Define granular classes for attempts and on-target shots
+SHOT_ON_GOAL_TYPES = {"shot", "shot-on-goal"}  # saved shots on goal (feed may use just "shot")
+MISS_TYPES         = {"missed-shot"}
+BLOCK_TYPES        = {"blocked-shot"}
+GOAL_TYPES         = {"goal"}
+SHOT_TYPES         = SHOT_ON_GOAL_TYPES | MISS_TYPES | BLOCK_TYPES  # all attempts
+MICRO_PROTECT_TYPES = {"hit","takeaway","giveaway","faceoff"}
 
-# Chemistry / co-presence filtering (kept; used in token horizon aggregation)
-RAW_SHARE_MIN = 0.12
-SEC_FLOOR_BASE = 6
-SHORT_WIN_SEC = 25
-SHORT_SHARE_MIN = 0.22
-SHORT_SEC_FRAC = 0.35
-TOPK_FALLBACK = 1
-
-
-# -------------------- IO helpers --------------------
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def load_json(path: str) -> Any:
+def load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
-def cap_skaters_to_six(cur: List[int], prev: List[int]) -> List[int]:
-    """
-    Data guard: some raw feeds occasionally provide >6 skaters for a side at a second (physically impossible).
-    We deterministically drop extras to get back to 6, preferring to keep continuity with the previous second.
-    """
-    cur2 = [int(x) for x in (cur or [])]
-    prev_set = set(int(x) for x in (prev or []))
-    while len(cur2) > 6:
-        # Prefer dropping a player who is not present in the previous snapshot (minimizes jitter)
-        drop_candidates = [x for x in cur2 if x not in prev_set]
-        if drop_candidates:
-            drop = sorted(drop_candidates)[-1]  # deterministic
-        else:
-            drop = sorted(cur2)[-1]
+def clock_str(abs_sec: int) -> str:
+    p = abs_sec % SECONDS_PER_PERIOD
+    return f"{p//60}:{p%60:02d}"
+
+def period_of(abs_sec: int) -> int:
+    return (abs_sec // SECONDS_PER_PERIOD) + 1
+
+def is_long_change(start_sec: int) -> bool:
+    """True in periods 2 and 4 (long change bench distance)."""
+    p = period_of(start_sec)
+    return p in (2, 4)
+
+# Global strength label (uses CURRENT second goalies)
+def strength_global(
+    home_skaters: int, away_skaters: int,
+    home_goalie_now: int, away_goalie_now: int
+) -> str:
+    if home_goalie_now == 0 and away_goalie_now == 1 and home_skaters >= away_skaters:
+        return "EA_home"
+    if away_goalie_now == 0 and home_goalie_now == 1 and away_skaters >= home_skaters:
+        return "EA_away"
+    pair = (home_skaters, away_skaters)
+    if pair == (5, 5): return "5v5"
+    if pair in {(5,4),(5,3),(4,3)}: return "PP_home"
+    if pair in {(4,5),(3,5),(3,4)}: return "PP_away"
+    if pair == (4, 4): return "4v4"
+    return f"{home_skaters}v{away_skaters}"
+
+# Per-team label from counts + current goalie presence
+def strength_for_team(
+    skaters_for: int, skaters_against: int,
+    goalie_for: int, goalie_against: int
+) -> str:
+    if goalie_for == 0 and goalie_against == 1 and skaters_for >= skaters_against:
+        return "EA"
+    if goalie_against == 0 and goalie_for == 1 and skaters_against >= skaters_for:
+        return "EN_for"
+    if skaters_for == 5 and skaters_against == 5: return "5v5"
+    if (skaters_for, skaters_against) in {(5,4),(5,3),(4,3)}: return "PP"
+    if (skaters_for, skaters_against) in {(4,5),(3,5),(3,4)}: return "PK"
+    if skaters_for == 4 and skaters_against == 4: return "4v4"
+    return f"{skaters_for}v{skaters_against}"
+
+# --- Role helpers for matchup-quality (C/L/R -> F; D stays D) ---
+F_CODES = {"F","C","L","R","LW","RW"}
+D_CODES = {"D","LD","RD"}
+
+def role_of(pos_code: Optional[str]) -> str:
+    c = (pos_code or "").upper()
+    if c in D_CODES or c == "D":
+        return "D"
+    if c in F_CODES:
+        return "F"
+    return "F"
+
+def is_credit_event(t: str) -> bool:
+    t = (t or "").lower().replace("_","-")
+    # attempts and goals are window-credit-relevant
+    return t in SHOT_TYPES or t in GOAL_TYPES
+
+# -------------------- Helpers --------------------
+def _safe_abs_sec(e: Dict[str, Any]) -> int:
+    try:
+        s = int(e.get("sec_game", -1))
+    except Exception:
+        s = -1
+    try:
+        p = int(e.get("period", 0) or 0)
+    except Exception:
+        p = 0
+    tip = str(e.get("timeInPeriod") or "").strip()
+    mm, ss = 0, 0
+    if tip and ":" in tip:
         try:
-            cur2.remove(drop)
-        except ValueError:
-            cur2 = cur2[:-1]
-    return cur2
-
-
-def load_player_meta_csv(path: str) -> Tuple[Dict[int, str], Dict[int, str]]:
-    """
-    Load player metadata mapping from a CSV that contains at least:
-      - playerId (or PlayerID)
-      - playerName (or PlayerName)
-      - positionCode (or Position)
-    Returns (player_name_map, player_pos_map). Missing/parse errors are skipped.
-    """
-    if not path:
-        return {}, {}
-    if not os.path.exists(path):
-        return {}, {}
-    name_map: Dict[int, str] = {}
-    pos_map: Dict[int, str] = {}
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            rr = csv.DictReader(f)
-            for row in rr:
-                pid = row.get("playerId") or row.get("PlayerID") or row.get("player_id") or row.get("id")
-                try:
-                    pid_i = int(float(str(pid).strip()))
-    except Exception:
-                    continue
-                if pid_i <= 0:
-                    continue
-                nm = (row.get("playerName") or row.get("PlayerName") or row.get("name") or "").strip()
-                pos = (row.get("positionCode") or row.get("Position") or row.get("position") or "").strip()
-                if nm and pid_i not in name_map:
-                    name_map[pid_i] = nm
-                if pos and pid_i not in pos_map:
-                    pos_map[pid_i] = pos
-    except Exception:
-        # best effort; return whatever we loaded
-        pass
-    return name_map, pos_map
-
-
-def load_player_handedness_csv(path: str) -> Dict[int, str]:
-    """
-    Load handedness (shoots/catches) from a CSV if available.
-    Accepts columns: handedness / shootsCatches / shoots_catches.
-    Returns playerId -> handedness (e.g. "L","R").
-    """
-    if not path or not os.path.exists(path):
-        return {}
-    out: Dict[int, str] = {}
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            rr = csv.DictReader(f)
-            for row in rr:
-                pid = row.get("playerId") or row.get("PlayerID") or row.get("player_id") or row.get("id")
-                try:
-                    pid_i = int(float(str(pid).strip()))
-    except Exception:
-                    continue
-                if pid_i <= 0:
-                    continue
-                hand = (row.get("handedness") or row.get("shootsCatches") or row.get("shoots_catches") or "").strip()
-                if hand and pid_i not in out:
-                    out[pid_i] = str(hand)
-    except Exception:
-        pass
-    return out
-
-
-def _parse_yyyy_mm_dd(s: str) -> Optional[datetime.date]:
-    try:
-        s = str(s or "").strip()
-        if not s:
-            return None
-        return datetime.date.fromisoformat(s[:10])
+            mm, ss = (int(x) for x in tip.split(":"))
         except Exception:
-        return None
+            mm, ss = 0, 0
+    expected = (p - 1) * SECONDS_PER_PERIOD + mm * 60 + ss if p >= 1 else max(0, s)
+    if p >= 1:
+        lo = (p - 1) * SECONDS_PER_PERIOD
+        hi = p * SECONDS_PER_PERIOD
+        if not (lo <= s < hi):
+            return expected
+    return s if s >= 0 else expected
 
-
-def compute_age_years(birth_date: Optional[datetime.date], on_date: Optional[datetime.date]) -> Optional[int]:
-    """Compute integer age in years at on_date."""
-    if birth_date is None or on_date is None:
-        return None
-    try:
-        years = on_date.year - birth_date.year
-        if (on_date.month, on_date.day) < (birth_date.month, birth_date.day):
-            years -= 1
-        if years < 0 or years > 80:
-            return None
-        return int(years)
+def _check_consistency(evts: List[Dict[str, Any]]) -> None:
+    bad = 0
+    for e in evts:
+        try:
+            s = int(e.get("sec_game")) if e.get("sec_game") is not None else None
         except Exception:
-        return None
+            s = None
+        s2 = _safe_abs_sec(e)
+        if s is not None and isinstance(s, int) and s != s2:
+            bad += 1
+    if bad:
+        print(f"[warn] corrected {bad} events with inconsistent sec_game vs period/timeInPeriod.")
 
+# -------------------- Per-second on-ice reconstruction --------------------
+def build_second_by_second_onice(evts: List[Dict[str,Any]]) -> Tuple[
+    List[Tuple[Tuple[int,...],Tuple[int,...]]],
+    List[Dict[str,int]]
+]:
+    if not evts:
+        return [], []
+    horizon = 0
+    for e in evts:
+        horizon = max(horizon, _safe_abs_sec(e))
+    horizon = min(horizon + 1, MAX_SECONDS)
 
-def last_non_shift_event_before(
-    *,
-    t_context: int,
-    lookback_sec: int,
-    events_by_sec: Dict[int, List[Dict[str, Any]]],
-) -> Tuple[str, int, int, str, int]:
-    """
-    Return the last "meaningful" event at or before t_context, within lookback_sec seconds.
-    Excludes shift-change events and period/game boundary admin events.
+    first = evts[0]
+    home = set(int(pid) for pid in (first.get("onice", {}).get("home") or []))
+    away = set(int(pid) for pid in (first.get("onice", {}).get("away") or []))
+    g_home = 1 if (first.get("onice", {}).get("goalies", {}).get("home")) else 0
+    g_away = 1 if (first.get("onice", {}).get("goalies", {}).get("away")) else 0
 
-    Returns: (event_type, event_sec, time_since_s, zone_code, owner_team_id)
-      - event_type="none" if not found within lookback
-      - event_sec=-1 if none
-      - time_since_s = t_context - event_sec (or lookback_sec+1 if none)
-      - zone_code in {"O","N","D","flow","na"} if available
-    """
-    t0 = int(t_context)
-    lb = max(0, int(lookback_sec))
-    ignore = {"shift-change", "shift_change", "shift change", "period-start", "period-end", "game-end"}
-    for s in range(t0, max(-1, t0 - lb) - 1, -1):
-        best_so = None
-        best_t = None
-        best_zone = "na"
-        best_owner = 0
-        for ev in (events_by_sec.get(int(s), []) or []):
-            et = str(ev.get("type") or "").lower()
-            if not et or et in ignore:
-                continue
-            so = _safe_int(ev.get("sortOrder", 0))
-            if best_so is None or so > int(best_so):
-                best_so = int(so)
-                best_t = et
-                det = ev.get("details") or {}
-                zc = det.get("zoneCode") or det.get("zone_code")
-                z = "na"
-                if zc:
-                    zc = str(zc).upper().strip()
-                    if zc in {"O", "N", "D"}:
-                        z = zc
-                else:
-                    # If no zoneCode, but this is a faceoff-like record, treat as flow/unknown.
-                    z = "na"
-                best_zone = z
-                best_owner = _safe_int(det.get("eventOwnerTeamId"), 0)
-        if best_t is not None:
-            return str(best_t), int(s), int(t0 - int(s)), str(best_zone), int(best_owner)
-    return "none", -1, int(lb + 1), "na", 0
+    team_onice_by_sec: List[Tuple[Tuple[int,...],Tuple[int,...]]] = []
+    goalies_by_team:   List[Dict[str,int]] = []
 
+    idx_by_time: Dict[int, List[Dict[str,Any]]] = defaultdict(list)
+    for e in evts:
+        idx_by_time[_safe_abs_sec(e)].append(e)
 
-def last_non_shift_event_before_adaptive(
-    *,
-    t_context: int,
-    events_by_sec: Dict[int, List[Dict[str, Any]]],
-    lookback_primary_sec: int = 6,
-    lookback_extended_sec: int = 10,
-) -> Tuple[str, int, int, int, str, int]:
-    """
-    Adaptive version:
-    - First search within lookback_primary_sec
-    - If not found, search within lookback_extended_sec
+    for s in range(horizon):
+        if s in idx_by_time:
+            for e in sorted(idx_by_time[s], key=lambda x: int(x.get("sortOrder", 0))):
+                oi = e.get("onice") or {}
+                sc = e.get("shift_change") or {}
 
-    Returns (event_type, event_sec, time_since_s, lookback_used_sec, zone_code, owner_team_id)
-    where lookback_used_sec is:
-      - lookback_primary_sec if found in primary window
-      - lookback_extended_sec if only found after extending
-      - 0 if not found at all
-    """
-    et, es, dt, z, owner = last_non_shift_event_before(t_context=t_context, lookback_sec=int(lookback_primary_sec), events_by_sec=events_by_sec)
-    if et != "none":
-        return et, es, dt, int(lookback_primary_sec), z, owner
-    et2, es2, dt2, z2, owner2 = last_non_shift_event_before(t_context=t_context, lookback_sec=int(lookback_extended_sec), events_by_sec=events_by_sec)
-    if et2 != "none":
-        return et2, es2, dt2, int(lookback_extended_sec), z2, owner2
-    return "none", -1, int(max(0, int(lookback_extended_sec)) + 1), 0, "na", 0
+                if sc:
+                    for pid in sc.get("home_in") or []:  home.add(int(pid))
+                    for pid in sc.get("home_out") or []: home.discard(int(pid))
+                    for pid in sc.get("away_in") or []:  away.add(int(pid))
+                    for pid in sc.get("away_out") or []: away.discard(int(pid))
+                elif oi:
+                    h = oi.get("home"); a = oi.get("away")
+                    if isinstance(h, list) and isinstance(a, list):
+                        home = set(int(p) for p in h)
+                        away = set(int(p) for p in a)
 
+                g = oi.get("goalies") or {}
+                if "home" in g: g_home = 1 if g.get("home") else 0
+                if "away" in g: g_away = 1 if g.get("away") else 0
 
-def build_shift_length_stats(onice_map: Dict[int, set], horizon: int) -> Dict[int, Dict[str, Any]]:
-    """
-    Build per-player completed shift length stats from a per-second on-ice map.
-    Returns dict:
-      stats[pid] = {"ends": [...], "cum_sum": [...], "cum_sum_sq": [...]}
-    where ends[i] is the last on-ice second of a completed shift, and cum_* are prefix sums
-    over the corresponding shift lengths in seconds (inclusive length).
-    """
-    # Track on/off transitions per player by scanning seconds.
-    # Only skaters appear in onice_map here; goalies are handled elsewhere.
-    current_start: Dict[int, int] = {}
-    ends_by_pid: Dict[int, List[int]] = defaultdict(list)
-    lens_by_pid: Dict[int, List[int]] = defaultdict(list)
+        team_onice_by_sec.append((tuple(sorted(home)), tuple(sorted(away))))
+        goalies_by_team.append({"home": g_home, "away": g_away})
 
-    for s in range(0, int(horizon) + 1):
-        on_now = onice_map.get(int(s), set()) or set()
-        on_prev = onice_map.get(int(s) - 1, set()) if s > 0 else set()
+    return team_onice_by_sec, goalies_by_team
 
-        entered = on_now - on_prev
-        exited = on_prev - on_now
+# -------------------- Window builder --------------------
+def build_windows(
+    evts: List[Dict[str,Any]],
+    hard_cap_sec: int = 0,
+    home_team_id: Optional[int] = None,
+    away_team_id: Optional[int] = None,
+    player_name_map: Optional[Dict[int, str]] = None,
+    player_pos_map: Optional[Dict[int, str]] = None,
+    debug_ga: bool = False,
+    debug_standings: bool = False,
+    game_pk: Optional[int] = None,
+) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]], List[Dict[str,Any]]]:
+    evts_sorted = sorted(evts, key=lambda e: (_safe_abs_sec(e), int(e.get("sortOrder",0))))
+    if not evts_sorted:
+        return [], [], []
+    _check_consistency(evts_sorted)
 
-        for pid in entered:
-            if pid not in current_start:
-                current_start[int(pid)] = int(s)
-        for pid in exited:
-            pid_i = int(pid)
-            st = current_start.pop(pid_i, None)
-            if st is None:
-                continue
-            # completed shift ended at s-1
-            end_s = int(s - 1)
-            ln = int(end_s - int(st) + 1)
-            if ln > 0 and ln <= 600:
-                ends_by_pid[pid_i].append(end_s)
-                lens_by_pid[pid_i].append(ln)
-
-    # Close any shift still on at horizon (treat as completed at horizon)
-    for pid_i, st in list(current_start.items()):
-        end_s = int(horizon)
-        ln = int(end_s - int(st) + 1)
-        if ln > 0 and ln <= 600:
-            ends_by_pid[pid_i].append(end_s)
-            lens_by_pid[pid_i].append(ln)
-
-    out: Dict[int, Dict[str, Any]] = {}
-    for pid_i, ends in ends_by_pid.items():
-        # Ensure sorted by end time
-        pairs = sorted(zip(ends, lens_by_pid.get(pid_i, [])), key=lambda x: x[0])
-        ends_sorted = [int(e) for e, _ in pairs]
-        lens_sorted = [int(l) for _, l in pairs]
-        cum_sum = []
-        cum_sum_sq = []
-        s1 = 0
-        s2 = 0
-        for l in lens_sorted:
-            s1 += int(l)
-            s2 += int(l) * int(l)
-            cum_sum.append(int(s1))
-            cum_sum_sq.append(int(s2))
-        out[int(pid_i)] = {"ends": ends_sorted, "cum_sum": cum_sum, "cum_sum_sq": cum_sum_sq}
-    return out
-
-
-def shift_mean_sd_before(stats: Dict[int, Dict[str, Any]], pid: int, t_context: int) -> Tuple[Optional[float], Optional[float], int]:
-    """
-    Return (mean, sd, n) of completed shift lengths for pid with shift_end < t_context.
-    """
-    st = stats.get(int(pid)) or {}
-    ends = st.get("ends") or []
-    if not ends:
-        return None, None, 0
-    idx = bisect.bisect_left(ends, int(t_context))
-    if idx <= 0:
-        return None, None, 0
-    cum_sum = st.get("cum_sum") or []
-    cum_sum_sq = st.get("cum_sum_sq") or []
-    s1 = float(cum_sum[idx - 1])
-    s2 = float(cum_sum_sq[idx - 1])
-    n = int(idx)
-    mean = float(s1 / float(n))
-    var = max(0.0, float(s2 / float(n) - mean * mean))
-    sd = float(math.sqrt(var))
-    return mean, sd, n
-
-
-def reason_proxy_bundle(
-    *,
-    token_type: str,
-    t_token: int,
-    t_context: int,
-    strength_team: str,
-    score_diff: int,
-    last_event_type: str,
-    last_event_owner_team_id: int,
-    our_team_id: int,
-    last_event_zone: str,
-    current_shift_elapsed_s: int,
-    mean_shift_len_s: Optional[float],
-    sd_shift_len_s: Optional[float],
-    position_code: str,
-    is_period_boundary: int,
-    own_goalie_pulled: int,
-    opp_goalie_pulled: int,
-    own_goalie_pull_transition: int,
-    opp_goalie_pull_transition: int,
-    boundary_prev_break_type: str,
-) -> Dict[str, Any]:
-    """
-    High-confidence reasoning proxy for shift/line changes.
-    Strategy: only emit "high confidence" labels when evidence is strong; otherwise label "unknown".
-    Always return a confidence score and evidence flags so you can filter or model uncertainty.
-    """
-    tt = str(token_type or "").upper()
-    if tt not in ("ENTRY", "EXIT", "STATE", "WINDOW_START"):
-        return {"label": "na", "confidence": 0.0}
-
-    let = str(last_event_type or "").lower()
-    z = str(last_event_zone or "").upper()
-    st = str(strength_team or "").upper()
-    owner_tid = int(last_event_owner_team_id or 0)
-    our_tid = int(our_team_id or 0)
-
-    flags = {
-        "is_special_teams": int(st in ("PP", "PK")),
-        "is_after_faceoff": int(let == "faceoff"),
-        "is_after_stoppage": int(let in ("stoppage", "goalie-stopped", "timeout", "challenge", "offside")),
-        "is_after_icing": int(let == "icing"),
-        "is_after_goal": int(let == "goal"),
-        "is_after_penalty": int(let == "penalty"),
-        "is_period_boundary": int(is_period_boundary),
-        "own_goalie_pulled": int(own_goalie_pulled),
-        "opp_goalie_pulled": int(opp_goalie_pulled),
-        "own_goalie_pull_transition": int(own_goalie_pull_transition),
-        "opp_goalie_pull_transition": int(opp_goalie_pull_transition),
-        "boundary_prev_break_type": str(boundary_prev_break_type or ""),
-        "zone_O": int(z == "O"),
-        "zone_D": int(z == "D"),
-        "zone_N": int(z == "N"),
-        "score_big": int(abs(int(score_diff)) >= 2),
-    }
-
-    # 1) Strongest: special teams rotations
-    if flags["is_special_teams"]:
-        return {"label": "special_teams", "confidence": 0.92, **flags}
-
-    # 1b) Period boundary is a very reliable shift-termination driver (esp for EXIT tokens)
-    if int(is_period_boundary) != 0:
-        return {"label": "period_boundary", "confidence": 0.98, **flags}
-
-    # 1c) Goalie pull/return transitions: extremely high confidence for goalie EXIT/ENTRY moments
-    pos = str(position_code or "").upper().strip()
-    if pos == "G" and int(own_goalie_pull_transition) != 0:
-        # goalie leaving because pulled or returning
-        return {"label": "goalie_pull_transition", "confidence": 0.99, **flags}
-
-    # 1d) Boundary strength-change context (window boundary tells us this cleanly)
-    if str(boundary_prev_break_type or "").lower() == "strength":
-        return {"label": "after_strength_change", "confidence": 0.97, **flags}
-
-    # 2) Strong: immediate context events (stoppages/faceoffs/goals/penalties/icing)
-    if let in ("faceoff", "stoppage", "goalie-stopped", "timeout", "challenge", "offside", "icing", "goal", "penalty"):
-        # classify for/against when owner is known
-        if owner_tid and our_tid and owner_tid != our_tid:
-            suf = "_against"
-        elif owner_tid and our_tid and owner_tid == our_tid:
-            suf = "_for"
+    # derive game_pk from root if present (for standings matching)
+    game_pk_local: Optional[int] = None
+    # prefer explicit argument
+    if isinstance(game_pk, int):
+        game_pk_local = int(game_pk)
     else:
-            suf = ""
-        return {"label": f"after_{let}{suf}", "confidence": 0.97, **flags}
-
-    # 3) Fatigue: require a clearly-long shift (relative to player's own mean when available)
-    mean_s = float(mean_shift_len_s) if mean_shift_len_s is not None else 45.0
-    sd_s = float(sd_shift_len_s) if sd_shift_len_s is not None else None
-    zscore = None
-    if sd_s is not None and sd_s > 1e-6:
-        zscore = float((float(current_shift_elapsed_s) - mean_s) / sd_s)
-    flags["fatigue_z"] = zscore
-    flags["shift_elapsed_s"] = int(current_shift_elapsed_s)
-    flags["shift_mean_s"] = float(mean_s)
-
-    if int(current_shift_elapsed_s) >= max(50, int(mean_s * 1.35)) and (zscore is None or zscore >= 1.0):
-        return {"label": "fatigue", "confidence": 0.85, **flags}
-
-    # 4) Everything else is genuinely ambiguous without coach intent, puck control, etc.
-    return {"label": "unknown", "confidence": 0.40, **flags}
-
-
-def get_player_landing_cached(player_id: int, cache_dir: str, *, allow_fetch: bool = True, timeout_s: float = 10.0) -> Dict[str, Any]:
-    """
-    Best-effort fetch of api-web player landing JSON with local caching.
-    Cache file: {cache_dir}/{player_id}.json
-    """
-    pid = int(player_id)
-    if pid <= 0:
-        return {}
-    cache_dir = str(cache_dir or "").strip() or "artifacts/cache/player_landing"
-    ensure_dir(cache_dir)
-    fp = os.path.join(cache_dir, f"{pid}.json")
-    try:
-        if os.path.exists(fp):
-            return load_json(fp) or {}
+        try:
+            root_game0 = evts_sorted[0].get("game", {})
+            gpk = root_game0.get("gamePk") or root_game0.get("game_pk") or root_game0.get("id")
+            game_pk_local = int(gpk) if gpk is not None else None
         except Exception:
-        pass
-    if not allow_fetch:
-        return {}
-    url = f"https://api-web.nhle.com/v1/player/{pid}/landing"
+            game_pk_local = None
+    if debug_standings:
+        print({"debug":"standings","init": True, "events": len(evts_sorted), "game_pk": game_pk_local})
+
+    # pull optional team ids from root events block if present
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
-            raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
-            try:
-                with open(fp, "w", encoding="utf-8") as f:
-                    json.dump(data, f)
+        root = evts_sorted[0].get("game", {})
+        home_team_id = home_team_id or root.get("home_team_id")
+        away_team_id = away_team_id or root.get("away_team_id")
     except Exception:
         pass
-            return data or {}
-    except Exception:
-        return {}
 
+    # per-second on-ice (skaters + goalie presence flags)
+    team_onice_by_sec, goalies_by_team = build_second_by_second_onice(evts_sorted)
+    horizon = len(team_onice_by_sec) - 1
 
-def load_raw_boxscore_team_meta(raw_dir: str, gamePk: int) -> Dict[str, Any]:
-    """
-    Extract team metadata from raw boxscore:
-      - home/away teamId, abbrev, fullName ("Place CommonName")
-    Returns dict with keys: homeTeamId, awayTeamId, homeAbbrev, awayAbbrev, homeName, awayName
-    """
-    out = {
-        "homeTeamId": 0,
-        "awayTeamId": 0,
-        "homeAbbrev": "",
-        "awayAbbrev": "",
-        "homeName": "",
-        "awayName": "",
-    }
-    if not raw_dir:
-        return out
-    raw_dir_fs = raw_dir.replace("/", os.sep).rstrip(os.sep)
-    box_path = os.path.join(raw_dir_fs, "boxscore", f"{int(gamePk)}.json")
-    if not os.path.exists(box_path):
-        return out
-    try:
-        bs = load_json(box_path) or {}
-        ht = bs.get("homeTeam") or {}
-        at = bs.get("awayTeam") or {}
-        out["homeTeamId"] = _safe_int(ht.get("id"), 0)
-        out["awayTeamId"] = _safe_int(at.get("id"), 0)
-        out["homeAbbrev"] = str(ht.get("abbrev") or "").strip()
-        out["awayAbbrev"] = str(at.get("abbrev") or "").strip()
-        hp = str(((ht.get("placeName") or {}).get("default")) or "").strip()
-        hc = str(((ht.get("commonName") or {}).get("default")) or "").strip()
-        ap = str(((at.get("placeName") or {}).get("default")) or "").strip()
-        ac = str(((at.get("commonName") or {}).get("default")) or "").strip()
-        out["homeName"] = (hp + " " + hc).strip() or hc or hp
-        out["awayName"] = (ap + " " + ac).strip() or ac or ap
-    except Exception:
-        return out
-    return out
-
-
-def _infer_raw_dir_from_pbpice_path(pbpice_path: str) -> str:
-    """
-    Given a path like ".../raw/pbpice/pbp_onice_<gamePk>.json", return the ".../raw" directory.
-    If not found, return empty string.
-    """
-    if not pbpice_path:
-        return ""
-    norm = pbpice_path.replace("\\", "/")
-    marker = "/raw/"
-    if marker not in norm:
-        return ""
-    return norm.split(marker)[0] + marker[:-1]  # keep trailing "/raw"
-
-
-def load_raw_boxscore_and_shiftcharts_meta(
-    raw_dir: str, gamePk: int
-) -> Tuple[str, str, str, Dict[int, str], Dict[int, str]]:
-    """
-    Best-effort extraction of:
-    - rinkid (arena name)
-    - season (string)
-    - date (YYYY-MM-DD)
-    - player_name_map (full if available)
-    - player_pos_map (positionCode)
-
-    Sources (if present):
-    - {raw_dir}/boxscore/{gamePk}.json: venue.default, season, gameDate, playerByGameStats.*.{forwards/defense/goalies}
-    - {raw_dir}/shiftcharts/{gamePk}.json: firstName/lastName per playerId (better full names)
-    """
-    rinkid = ""
-    season = ""
-    date = ""
-    name_map: Dict[int, str] = {}
-    pos_map: Dict[int, str] = {}
-
-    if not raw_dir:
-        return rinkid, season, date, name_map, pos_map
-
-    raw_dir_fs = raw_dir.replace("/", os.sep).rstrip(os.sep)
-    box_path = os.path.join(raw_dir_fs, "boxscore", f"{int(gamePk)}.json")
-    shifts_path = os.path.join(raw_dir_fs, "shiftcharts", f"{int(gamePk)}.json")
-
-    # boxscore: arena + player positions + short names
-    try:
-        if os.path.exists(box_path):
-            bs = load_json(box_path)
-            try:
-                rinkid = str(((bs.get("venue") or {}).get("default")) or "").strip()
-                except Exception:
-                rinkid = ""
+    # Build per-second goalie IDs by side using on-ice snapshots in events (carry forward latest)
+    snaps_goalie_ids: Dict[int, Dict[str,int]] = {}
+    for e in evts_sorted:
+        try:
+            s_abs = _safe_abs_sec(e)
+            oi = e.get("onice") or {}
+            g = oi.get("goalies") or {}
+            if "home" in g or "away" in g:
+                entry = snaps_goalie_ids.setdefault(s_abs, {"home": 0, "away": 0})
                 try:
-                season = str(bs.get("season") or "").strip()
+                    if "home" in g: entry["home"] = int(g.get("home") or 0)
                 except Exception:
-                season = ""
+                    entry["home"] = entry.get("home", 0)
+                try:
+                    if "away" in g: entry["away"] = int(g.get("away") or 0)
+                except Exception:
+                    entry["away"] = entry.get("away", 0)
+        except Exception:
+            pass
+    goalie_ids_by_sec: List[Dict[str,int]] = [{"home":0,"away":0} for _ in range(max(0, horizon+1))]
+    last_home_id, last_away_id = 0, 0
+    for s in range(max(0, horizon+1)):
+        snap = snaps_goalie_ids.get(s)
+        if snap is not None:
             try:
-                date = str(bs.get("gameDate") or "").strip()
+                if snap.get("home") is not None:
+                    last_home_id = int(snap.get("home") or 0)
+                if snap.get("away") is not None:
+                    last_away_id = int(snap.get("away") or 0)
             except Exception:
-                date = ""
+                pass
+        goalie_ids_by_sec[s] = {"home": last_home_id, "away": last_away_id}
 
-            pbg = bs.get("playerByGameStats") or {}
-            for team_key in ("homeTeam", "awayTeam"):
-                team = pbg.get(team_key) or {}
-                for group in ("forwards", "defense", "goalies"):
-                    for pr in (team.get(group) or []):
-                        try:
-                            pid = int(pr.get("playerId"))
-                        except Exception:
-                            continue
-                        if pid <= 0:
-                            continue
-                        pos = str(pr.get("position") or "").strip()
-                        nm = str(((pr.get("name") or {}).get("default")) or "").strip()
-                        if pos and pid not in pos_map:
-                            pos_map[pid] = pos
-                        if nm and pid not in name_map:
-                            name_map[pid] = nm
+    # --- Pulled-goalie precomputation ---
+    pulled_home = [0]*(horizon+1)
+    pulled_away = [0]*(horizon+1)
+    for s in range(horizon+1):
+        g = goalies_by_team[s]
+        pulled_home[s] = 1 if g["home"] == 0 else 0
+        pulled_away[s] = 1 if g["away"] == 0 else 0
+
+    since_pulled_home = [0]*(horizon+1)
+    since_pulled_away = [0]*(horizon+1)
+    for s in range(1, horizon+1):
+        since_pulled_home[s] = (since_pulled_home[s-1] + 1) if pulled_home[s] else 0
+        since_pulled_away[s] = (since_pulled_away[s-1] + 1) if pulled_away[s] else 0
+
+    # --- 5v5 usage per game (seconds) and role-separated percentiles ---
+    home_5v5_sec, away_5v5_sec = defaultdict(int), defaultdict(int)
+
+    def is_5v5_strength(s: int) -> bool:
+        ss = max(0, min(s, horizon))
+        h_ids, a_ids = team_onice_by_sec[ss]
+        g = goalies_by_team[ss]
+        return strength_global(len(h_ids), len(a_ids), g["home"], g["away"]) == "5v5"
+
+    for s in range(max(0, horizon)):
+        if not is_5v5_strength(s):
+            continue
+        h_ids, a_ids = team_onice_by_sec[s]
+        for pid in h_ids:
+            home_5v5_sec[pid] += 1
+        for pid in a_ids:
+            away_5v5_sec[pid] += 1
+
+    def percentiles_by_role(seconds_by_pid: Dict[int,int]) -> Dict[int,float]:
+        buckets = defaultdict(list)  # role -> [(pid, sec)]
+        for pid, sec in seconds_by_pid.items():
+            pos = (player_pos_map.get(pid) if isinstance(player_pos_map, dict) else None)
+            buckets[role_of(pos)].append((pid, sec))
+        pct: Dict[int,float] = {}
+        for role, rows in buckets.items():
+            if not rows:
+                continue
+            rows.sort(key=lambda kv: kv[1])
+            n = len(rows)
+            if n == 1:
+                pct[rows[0][0]] = 0.5
+                continue
+            i = 0
+            while i < n:
+                j = i
+                sec_i = rows[i][1]
+                while j+1 < n and rows[j+1][1] == sec_i:
+                    j += 1
+                mid = (i + j) / 2.0
+                p = mid / (n - 1) if (n - 1) > 0 else 0.5
+                for k in range(i, j+1):
+                    pct[rows[k][0]] = float(p)
+                i = j + 1
+        return pct
+
+    home_pct_role_5v5 = percentiles_by_role(home_5v5_sec)
+    away_pct_role_5v5 = percentiles_by_role(away_5v5_sec)
+    DEFAULT_PCT = 0.5
+
+    def strength_at(s: int) -> str:
+        s = max(0, min(s, horizon))
+        home_ids, away_ids = team_onice_by_sec[s]
+        gnow = goalies_by_team[s]
+        return strength_global(len(home_ids), len(away_ids), gnow["home"], gnow["away"])
+
+    # Index event types per second (for protective micro-events + faceoff awareness)
+    types_by_sec: Dict[int, set] = defaultdict(set)
+    # Event orders per second so we can reason about sort order within a second
+    orders_by_sec: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
+    # Same-second intra-order per second (if provided by feed)
+    sso_by_sec: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
+    # Full events by second for personal counts (e.g., giveaways/takeaways)
+    events_by_sec: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    # Aggregate shift-change ins/outs per second for jitter correction
+    shift_changes_by_sec: Dict[int, Dict[str, set]] = defaultdict(lambda: {
+        "home_in": set(), "home_out": set(), "away_in": set(), "away_out": set()
+    })
+    for e in evts_sorted:
+        t = (e.get("type") or "").lower().replace("_","-")
+        s = _safe_abs_sec(e)
+        so = int(e.get("sortOrder", 0))
+        types_by_sec[s].add(t)
+        orders_by_sec[s].append((so, t))
+        try:
+            sso = int(e.get("same_sec_order", 0))
+        except Exception:
+            sso = 0
+        sso_by_sec[s].append((sso, t))
+        events_by_sec[s].append({
+            "type": t,
+            "details": (e.get("details") or {}),
+            "sortOrder": so,
+        })
+        sc = e.get("shift_change") or {}
+        try:
+            for k in ("home_in","home_out","away_in","away_out"):
+                for pid in sc.get(k) or []:
+                    shift_changes_by_sec[s][k].add(int(pid))
         except Exception:
             pass
 
-    # shiftcharts: full names
-    try:
-        if os.path.exists(shifts_path):
-            sh = load_json(shifts_path)
-            if isinstance(sh, list):
-                for r in sh:
-                    try:
-                        pid = int(r.get("playerId"))
-                    except Exception:
-                        continue
-                    if pid <= 0:
-                        continue
-                    fn = str(r.get("firstName") or "").strip()
-                    ln = str(r.get("lastName") or "").strip()
-                    full = (fn + " " + ln).strip()
-                    if full:
-                        name_map[pid] = full  # prefer full name
+    def has_credit_before_faceoff(sec: int) -> bool:
+        # Prefer same_sec_order if present
+        evs_sso = sorted(sso_by_sec.get(sec, []))
+        face_sso = [sso for sso, t in evs_sso if t == "faceoff"]
+        credit_sso = [sso for sso, t in evs_sso if (t in SHOT_TYPES or t in GOAL_TYPES)]
+        if face_sso:
+            if not credit_sso:
+                return False
+            return min(credit_sso) < min(face_sso)
+        # Fallback to sortOrder
+        evs = sorted(orders_by_sec.get(sec, []))
+        if not evs:
+            return False
+        face_orders = [so for so, t in evs if t == "faceoff"]
+        credit_orders = [so for so, t in evs if (t in SHOT_TYPES or t in GOAL_TYPES)]
+        if not credit_orders:
+            return False
+        if not face_orders:
+            return True
+        return min(credit_orders) < min(face_orders)
+
+    def has_sog_before_goalie_stop(sec: int) -> bool:
+        evs = sorted(orders_by_sec.get(sec, []))
+        if not evs:
+            return False
+        sog_orders = [so for so, t in evs if t in SHOT_ON_GOAL_TYPES]
+        gs_orders  = [so for so, t in evs if t == "goalie-stopped"]
+        if not sog_orders or not gs_orders:
+            return False
+        return min(sog_orders) < min(gs_orders)
+
+    def has_defense_save_before_whistle(sec: int) -> bool:
+        # treat blocks (BA for the attacker) or takeaways as protective if before boundary whistle/faceoff
+        evs = sorted(orders_by_sec.get(sec, []))
+        if not evs:
+            return False
+        block_orders = [so for so, t in evs if t in BLOCK_TYPES]
+        takeaway_orders = [so for so, t in evs if t == "takeaway"]
+        boundary_types = {"faceoff","stoppage","goal","goalie-stopped","penalty","timeout","challenge"}
+        boundary_orders = [so for so, t in evs if t in boundary_types]
+        if not boundary_orders:
+            return bool(block_orders or takeaway_orders)
+        bmin = min(boundary_orders)
+        return (block_orders and min(block_orders) < bmin) or (takeaway_orders and min(takeaway_orders) < bmin)
+
+    def goal_swap_cand_out_ids(sec: int, side: str) -> set:
+        """Identify any single player who appears at 'sec' for 'side' but was not present at sec-1,
+        while a credited goal participant (scorer/assist) is missing from 'side' at 'sec' but present at sec-1.
+        If found, return a set with that one candidate id; else empty set.
+        """
+        try:
+            end_events = [ev for ev in events_by_sec.get(sec, []) if ev.get("type") == "goal"]
+        except Exception:
+            end_events = []
+        if not end_events:
+            return set()
+        # Respect boundary ordering: require the goal to occur before any boundary at this second
+        evs_end = sorted(orders_by_sec.get(sec, []))
+        boundary_types = {"faceoff","stoppage","goal","goalie-stopped","penalty","timeout","challenge"}
+        end_boundary_orders = [so for so, t in evs_end if t in boundary_types]
+        end_boundary_order = min(end_boundary_orders) if end_boundary_orders else None
+        if end_boundary_order is None:
+            return set()
+        # choose the first goal with sortOrder < end_boundary
+        goal_ev = None
+        for ev in end_events:
+            try:
+                so = int(ev.get("sortOrder", 0))
             except Exception:
-                pass
-
-    return rinkid, season, date, name_map, pos_map
-
-
-def write_csv(path: str, rows: List[Dict[str, Any]], keys: List[str]) -> None:
-    ensure_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-
-def stable_sample_ints(candidates: Sequence[int], k: int, seed: int) -> List[int]:
-    """Deterministic sample without importing numpy; stable across runs."""
-    if k <= 0:
-        return []
-    cand = list(dict.fromkeys(int(x) for x in candidates))  # unique, preserve order
-    if len(cand) <= k:
-        return cand
-    import random
-    rng = random.Random(int(seed))
-    # Fisher-Yates partial shuffle
-    for i in range(min(k, len(cand) - 1)):
-        j = rng.randrange(i, len(cand))
-        cand[i], cand[j] = cand[j], cand[i]
-    return cand[:k]
-
-
-# -------------------- Time / strength helpers --------------------
-
-def period_of(sec_game: int) -> int:
-    return int(sec_game // SECONDS_PER_PERIOD) + 1
-
-
-def clock_s_at(sec_game: int) -> int:
-    return int(sec_game % SECONDS_PER_PERIOD)
-
-
-def clock_str(sec_game: int) -> str:
-    s = clock_s_at(sec_game)
-    mm = int(s // 60)
-    ss = int(s % 60)
-    return f"{mm}:{ss:02d}"
-
-
-def is_long_change(sec_game: int) -> int:
-    # Long change in periods 2 and 4 (OT treated as 4 here)
-    p = period_of(sec_game)
-    return int(p in (2, 4))
-
-
-def strength_for_team(sk_for: int, sk_against: int, goalie_for: int, goalie_against: int) -> str:
-    # goalie_for==0 means pulled
-    if goalie_for == 0 and goalie_against > 0:
-        return "EN_for"
-    if goalie_against == 0 and goalie_for > 0:
-        return "EN_against"
-    if sk_for == sk_against:
-        return "5v5" if sk_for == 5 else f"{sk_for}v{sk_against}"
-    if sk_for > sk_against:
-        return "PP"
-    return "PK"
-
-
-# -------------------- Event parsing helpers --------------------
-
-def _owner_side_for_event(details: Dict[str, Any], home_team_id: Optional[int], away_team_id: Optional[int]) -> Optional[str]:
-    tid = details.get("eventOwnerTeamId") or details.get("teamId") or details.get("committingTeamId")
-    try:
-        tid = int(tid) if tid is not None else None
-        except Exception:
-        tid = None
-    if tid is None:
-        return None
-    try:
-        if home_team_id is not None and int(tid) == int(home_team_id):
-            return "home"
-        if away_team_id is not None and int(tid) == int(away_team_id):
-            return "away"
-        except Exception:
-        return None
-    return None
-
-
-def _zone_bucket(details: Dict[str, Any]) -> Optional[str]:
-    z = details.get("zoneCode") or details.get("zone") or details.get("zone_code")
-    if z is None:
-        return None
-    z = str(z).upper().strip()
-    if z in ("O", "OFF", "OFFENSIVE", "OZ"):
-        return "OZ"
-    if z in ("N", "NEU", "NEUTRAL", "NZ"):
-        return "NZ"
-    if z in ("D", "DEF", "DEFENSIVE", "DZ"):
-        return "DZ"
-    return None
-
-
-def _bump_zone_counter(dst: Dict[str, int], details: Dict[str, Any]) -> None:
-    zb = _zone_bucket(details)
-    if zb in dst:
-        dst[zb] += 1
-
-
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-        except Exception:
-        return default
-
-
-def _maybe_correct_onice_for_goal(
-    sec: int,
-    ev: Dict[str, Any],
-    pre_home_set: set,
-    pre_away_set: set,
-    home_team_id: Optional[int],
-    away_team_id: Optional[int],
-    team_onice_by_sec: List[Tuple[List[int], List[int]]],
-    orders_by_sec: Dict[int, List[Tuple[int, str]]],
-    shift_changes_by_sec: Dict[int, Dict[str, set]],
-) -> Tuple[set, set]:
-    """
-    Jitter correction for goals.
-    - If a same-second shift-change precedes the goal (sortOrder), or a shift at sec-1, use prior on-ice snapshot.
-    - If credited scorer/assist is missing from on-ice set, look back up to 3s and swap in for a cameo.
-    """
-    det = ev.get("details") or {}
-    goal_so = _safe_int(ev.get("sortOrder", 0))
-
-    side_local = _owner_side_for_event(det, home_team_id, away_team_id)
-
-    base_home = set(pre_home_set)
-    base_away = set(pre_away_set)
-
-    # shift-change before goal in same second?
-    same_sec_shift_before = False
-    try:
-        evs_this = orders_by_sec.get(sec, [])
-        same_sec_shift_before = any((t == "shift-change" and so < goal_so) for so, t in evs_this)
-            except Exception:
-        same_sec_shift_before = False
-    tminus1_has_shift = bool(shift_changes_by_sec.get(sec - 1)) if sec - 1 >= 0 else False
-
-    if same_sec_shift_before or tminus1_has_shift:
-        start_prev = sec - 2 if tminus1_has_shift else sec - 1
-        lookback = 0
-        prev_s = start_prev
-        while prev_s >= 0 and lookback < 30:
-            if prev_s < len(team_onice_by_sec):
-                ph, pa = team_onice_by_sec[prev_s]
-                base_home = set(ph)
-                base_away = set(pa)
-                # prefer stable-ish 5v5 frames if possible
-                if len(ph) >= 5 and len(pa) >= 5:
+                so = 0
+            if so < end_boundary_order:
+                goal_ev = ev
                 break
-            prev_s -= 1
-            lookback += 1
-
-    parts: List[int] = []
-    for k in ("scoringPlayerId", "assist1PlayerId", "assist2PlayerId"):
+        if goal_ev is None:
+            return set()
+        det = goal_ev.get("details") or {}
+        cb_end = credit_by_sec.get(sec)
+        if not cb_end:
+            return set()
+        pre_home = set(cb_end.get("onice_home") or [])
+        pre_away = set(cb_end.get("onice_away") or [])
+        side_set = pre_home if side == "home" else pre_away
+        # participants
+        parts = []
+        for k in ("scoringPlayerId","assist1PlayerId","assist2PlayerId"):
             v = det.get(k)
             try:
                 if v is not None:
                     parts.append(int(v))
             except Exception:
-            continue
-
-    if parts and side_local in ("home", "away"):
-        goal_set = base_home if side_local == "home" else base_away
-        missing = next((pid for pid in parts if pid not in goal_set), None)
-        if missing is not None:
-            prev_side_set = None
-            for back in range(1, 4):
-                s_prev = sec - back
-                if s_prev < 0 or s_prev >= len(team_onice_by_sec):
-                    continue
-                prev_home, prev_away = team_onice_by_sec[s_prev]
-                prev_side_tmp = set(prev_home) if side_local == "home" else set(prev_away)
-                if missing in prev_side_tmp:
-                    prev_side_set = prev_side_tmp
+                pass
+        if not parts:
+            return set()
+        # Look back 1 second for prior on-ice
+        if sec - 1 < 0 or sec - 1 >= len(team_onice_by_sec):
+            return set()
+        prev_home, prev_away = team_onice_by_sec[sec - 1]
+        prev_side = set(prev_home) if side == "home" else set(prev_away)
+        missing = None
+        for pid in parts:
+            if pid not in side_set and pid in prev_side:
+                missing = pid
                 break
-            if prev_side_set is not None:
-                cand_out = next((pid_now for pid_now in list(goal_set) if pid_now not in prev_side_set), None)
-                if cand_out is not None:
-                    goal_set.discard(cand_out)
-                    goal_set.add(missing)
-        if side_local == "home":
-            base_home = goal_set
-        else:
-            base_away = goal_set
+        if missing is None:
+            return set()
+        # find a candidate to swap out: someone new now not present previously
+        cand_out = None
+        # prioritize from shift change signals
+        now_in_key = ("home_in" if side == "home" else "away_in")
+        prev_out_key = ("home_out" if side == "home" else "away_out")
+        now_in = set((shift_changes_by_sec.get(sec) or {}).get(now_in_key, set()))
+        prev_out = set((shift_changes_by_sec.get(sec - 1) or {}).get(prev_out_key, set()))
+        for pid_now in side_set:
+            if pid_now not in prev_side and (pid_now in now_in or pid_now in prev_out or True):
+                cand_out = pid_now
+                break
+        return {cand_out} if cand_out is not None else set()
 
-    return base_home, base_away
-
-
-# -------------------- Core builders --------------------
-
-@dataclass
-class ParsedGame:
-    gamePk: int
-    home_team_id: int
-    away_team_id: int
-    events: List[Dict[str, Any]]
-
-
-def parse_game(pbp_onice: Dict[str, Any]) -> ParsedGame:
-    gamePk = int(pbp_onice.get("gamePk"))
-    home_team_id = int(pbp_onice.get("home", {}).get("teamId"))
-    away_team_id = int(pbp_onice.get("away", {}).get("teamId"))
-    events = list(pbp_onice.get("events") or [])
-    return ParsedGame(gamePk=gamePk, home_team_id=home_team_id, away_team_id=away_team_id, events=events)
-
-
-def build_second_index(game: ParsedGame) -> Tuple[
-    List[Tuple[List[int], List[int]]],  # team_onice_by_sec
-    List[Dict[str, int]],               # goalie_ids_by_sec
-    Dict[int, List[Dict[str, Any]]],    # events_by_sec
-    Dict[int, List[Tuple[int, str]]],   # orders_by_sec: (sortOrder, type)
-    Dict[int, List[Tuple[int, str]]],   # sso_by_sec: (same_sec_order, type)
-    Dict[int, Dict[str, set]],          # shift_changes_by_sec
-    Dict[int, Dict[str, Any]],          # end_event_at
-    Dict[int, Dict[str, Any]],          # fo_meta
-    set,                                # tv_timeout_secs
-    int,                                # horizon (max sec)
-]:
-    events_by_sec: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    orders_by_sec: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
-    sso_by_sec: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
-    shift_changes_by_sec: Dict[int, Dict[str, set]] = defaultdict(lambda: {"home_in": set(), "home_out": set(), "away_in": set(), "away_out": set()})
-    end_event_at: Dict[int, Dict[str, Any]] = {}
-    fo_meta: Dict[int, Dict[str, Any]] = {}
-    tv_timeout_secs: set = set()
-
-    max_sec = 0
-    for ev in game.events:
-        sec = ev.get("sec_game")
-        if sec is None:
-            continue
-        sec = int(sec)
-        max_sec = max(max_sec, sec)
-        et = str(ev.get("type") or "").lower()
-        events_by_sec[sec].append(ev)
-        orders_by_sec[sec].append((_safe_int(ev.get("sortOrder", 0)), et))
-        sso_by_sec[sec].append((_safe_int(ev.get("same_sec_order", 0)), et))
-
-        # faceoff metadata at second
-        if et == "faceoff":
-            det = ev.get("details") or {}
-            zc = det.get("zoneCode")
-            z = "flow"
-            if zc:
-                zc = str(zc).upper()
-                if zc == "O":
-                    z = "O"
-                elif zc == "D":
-                    z = "D"
-                elif zc == "N":
-                    z = "N"
-            fo_meta[sec] = {
-                "zone": z,
-                "eventOwnerTeamId": det.get("eventOwnerTeamId"),
-                "winningPlayerId": det.get("winningPlayerId"),
-                "losingPlayerId": det.get("losingPlayerId"),
+    # Faceoff meta
+    fo_meta: Dict[int, Dict[str,Any]] = {}
+    for e in evts_sorted:
+        if (e.get("type") or "").lower().replace("_","-") == "faceoff":
+            d = e.get("details") or {}
+            s = _safe_abs_sec(e)
+            fo_meta[s] = {
+                "zone": (d.get("zoneCode") or "").upper()[:1] or "N",
+                "winningPlayerId": d.get("winningPlayerId"),
+                "losingPlayerId": d.get("losingPlayerId"),
+                "eventOwnerTeamId": d.get("eventOwnerTeamId"),
             }
 
-        # shift-change deltas (already provided)
-        if et == "shift-change":
-            sc = ev.get("shift_change") or {}
-            for k in ("home_in", "home_out", "away_in", "away_out"):
-                vals = sc.get(k) or []
-                try:
-                    shift_changes_by_sec[sec][k].update(int(x) for x in vals)
+    # Natural breaks (keep highest-priority per second)
+    break_secs = set()
+    end_event_at: Dict[int, Dict[str,Any]] = {}
+
+    def _prio(t: str) -> int:
+        t = (t or "").lower()
+        if t == "goal": return 4
+        if t == "penalty": return 3
+        if t in {"stoppage","puck-out-of-play","goalie-stopped","icing","offside","timeout","challenge"}: return 2
+        if t == "faceoff": return 1
+        return 0
+
+    for e in evts_sorted:
+        t = (e.get("type") or "").lower().replace("_","-")
+        s = _safe_abs_sec(e)
+        if t in NATURAL_BREAK_TYPES:
+            break_secs.add(s)
+            cur = end_event_at.get(s, {})
+            if _prio(t) >= _prio(cur.get("type")): end_event_at[s] = {"type": t, "details": e.get("details") or {}}
+
+    # Media timeout (TV) detection: EXPLICIT ONLY (no heuristics)
+    tv_timeout_secs = set()
+    # explicit via end_event_at summary
+    def _tv_flag_from_details(det: Dict[str, Any]) -> bool:
+        keys = (
+            "reason",
+            "secondaryReason",
+            "stoppageReason",
+            "secondary_reason",
+            "stoppage_reason",
+        )
+        for k in keys:
+            v = det.get(k)
+            if v is None:
+                continue
+            txt = str(v).lower()
+            if ("tv" in txt) or ("media" in txt) or ("commercial" in txt):
+                return True
+        return False
+
+    for s, meta in end_event_at.items():
+        t = (meta.get("type") or "").lower()
+        det = (meta.get("details") or {})
+        if t in {"stoppage","goalie-stopped"} and _tv_flag_from_details(det):
+            tv_timeout_secs.add(s)
+    # explicit via raw events at that second (covers cases where penalty is the end_event_at)
+    for e in evts_sorted:
+        s = _safe_abs_sec(e)
+        t = (e.get("type") or "").lower().replace("_","-")
+        if t not in ("stoppage","goalie-stopped"):
+            continue
+        det = (e.get("details") or {})
+        if _tv_flag_from_details(det):
+            tv_timeout_secs.add(s)
+    # remove previous heuristic stamping completely
+
+    # --- Delayed penalty active seconds: starts at 'delayed-penalty', ends at next 'penalty' whistle ---
+    delayed_active_by_sec: List[bool] = [False] * (horizon + 1)
+    dp_active = False
+    for s in range(0, horizon + 1):
+        tset = types_by_sec.get(s, set())
+        if "penalty" in tset:
+            dp_active = False
+        if "delayed-penalty" in tset:
+            dp_active = True
+        delayed_active_by_sec[s] = dp_active
+
+    # --- Pre-index credited events per second (DIRECTIONAL), store OWNER + PRE-CHANGE on-ice ---
+    credit_by_sec: Dict[int, Dict[str, Any]] = defaultdict(lambda: {
+        "home": Counter(), "away": Counter(),
+        "owner_team_id": None,
+        "onice_home": set(), "onice_away": set()
+    })
+
+    # >>> NEW: dedupe multiple goal packets for the same (second, owner team, scorer)
+    seen_goal_keys = set()  # (sec_game, owner_team_id, scorerId)
+
+    def _owner_side_for_event(d: Dict[str,Any], home_pre: set, away_pre: set) -> Optional[str]:
+        """Return 'home' or 'away' if we can determine the owner; else None."""
+        owner_team_id = d.get("eventOwnerTeamId")
+        side = None
+        if owner_team_id is not None and home_team_id is not None and away_team_id is not None:
+            try:
+                if int(owner_team_id) == int(home_team_id): side = "home"
+                elif int(owner_team_id) == int(away_team_id): side = "away"
             except Exception:
-                    pass
+                side = None
+        if side is None:
+            shooter = d.get("shootingPlayerId") or d.get("scoringPlayerId")
+            try:
+                shooter = int(shooter) if shooter is not None else None
+            except Exception:
+                shooter = None
+            if shooter is not None:
+                if shooter in home_pre: side = "home"
+                elif shooter in away_pre: side = "away"
+        return side
 
-        # TV timeout signal (if present as stoppage reason)
-        if et in ("stoppage", "goalie-stopped"):
-            det = ev.get("details") or {}
-            reason = str(det.get("reason") or det.get("stoppageReason") or "").lower()
-            if "tv" in reason or "media" in reason or "commercial" in reason:
-                tv_timeout_secs.add(sec)
-
-        # store last event at second (for break reason/metadata)
-        end_event_at[sec] = ev
-
-    # Build per-second on-ice snapshots from event.onice (pre-change snapshots)
-    horizon = max_sec
-    team_onice_by_sec: List[Tuple[List[int], List[int]]] = [([], []) for _ in range(horizon + 2)]
-    goalie_ids_by_sec: List[Dict[str, int]] = [{"home": 0, "away": 0} for _ in range(horizon + 2)]
-
-    last_home: List[int] = []
-    last_away: List[int] = []
-    last_goalies = {"home": 0, "away": 0}
-
-    for s in range(horizon + 1):
-        prev_home = list(last_home)
-        prev_away = list(last_away)
-        # choose the last event in this second with onice snapshot, preferring sec_phase == pre-change
-        chosen = None
-        for ev in events_by_sec.get(s, []):
-            if isinstance(ev.get("onice"), dict):
-                if str(ev.get("sec_phase") or "").lower() == "pre-change":
-                    chosen = ev
-        if chosen is None:
-            for ev in reversed(events_by_sec.get(s, [])):
-                if isinstance(ev.get("onice"), dict):
-                    chosen = ev
-                    break
-        if chosen is not None:
-            on = chosen.get("onice") or {}
-            h = on.get("home") or []
-            a = on.get("away") or []
-            last_home = [int(x) for x in h]
-            last_away = [int(x) for x in a]
-            g = (on.get("goalies") or {})
-            last_goalies = {
-                "home": _safe_int(g.get("home", last_goalies["home"])),
-                "away": _safe_int(g.get("away", last_goalies["away"])),
-            }
-        # Hard cap skaters to 6 (raw feed can glitch to 7+)
-        if len(last_home) > 6:
-            last_home = cap_skaters_to_six(last_home, prev_home)
-        if len(last_away) > 6:
-            last_away = cap_skaters_to_six(last_away, prev_away)
-        # Data guard (NON-STICKY): some feeds occasionally report 6 skaters while still listing a goalie id.
-        # Physically, 6 skaters implies the goalie is not on the ice (pulled / extra attacker) *for that second*.
-        # Important: do NOT mutate `last_goalies` here, or you can "stick" goalie_id=0 for long stretches if later
-        # on-ice snapshots omit goalie ids. Instead, compute a per-second goalie snapshot with the guard applied.
-        goalies_now = dict(last_goalies)
-        if len(last_home) >= 6:
-            goalies_now["home"] = 0
-        if len(last_away) >= 6:
-            goalies_now["away"] = 0
-        team_onice_by_sec[s] = (list(last_home), list(last_away))
-        goalie_ids_by_sec[s] = goalies_now
-
-    return (
-        team_onice_by_sec,
-        goalie_ids_by_sec,
-        events_by_sec,
-        orders_by_sec,
-        sso_by_sec,
-        shift_changes_by_sec,
-        end_event_at,
-        fo_meta,
-        tv_timeout_secs,
-        horizon,
-    )
-
-
-def build_credit_by_sec(
-    game: ParsedGame,
-    team_onice_by_sec: List[Tuple[List[int], List[int]]],
-    goalie_ids_by_sec: List[Dict[str, int]],
-    events_by_sec: Dict[int, List[Dict[str, Any]]],
-    orders_by_sec: Dict[int, List[Tuple[int, str]]],
-    shift_changes_by_sec: Dict[int, Dict[str, set]],
-) -> Tuple[Dict[int, Dict[str, Any]], List[int], List[int]]:
-    """
-    Build a per-second directional credit dict:
-      credit_by_sec[s] = {
-        "home": Counter-like dict of AF/SF/BF/GF etc,
-        "away": ...
-        "onice_home": list of skaters home (pre-change snapshot for this second)
-        "onice_away": list of skaters away
-      }
-    Also build cumulative goals arrays for score state at token times.
-    """
-    credit_by_sec: Dict[int, Dict[str, Any]] = {}
-
-    horizon = len(team_onice_by_sec) - 2
-    cum_home_goals = [0] * (horizon + 2)
-    cum_away_goals = [0] * (horizon + 2)
-
-    seen_goal_keys: set = set()
-
-    for s in range(horizon + 1):
-        home_ids, away_ids = team_onice_by_sec[s]
-        cb = {
-            "home": Counter(),
-            "away": Counter(),
-            "onice_home": list(home_ids),
-            "onice_away": list(away_ids),
-        }
-        evs = events_by_sec.get(s, [])
-        for ev in evs:
-            et = str(ev.get("type") or "").lower()
-            if et not in SHOT_TYPES and et not in GOAL_TYPES and et not in MICRO_TYPES:
+    events_by_sec: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for e in evts_sorted:
+        t = (e.get("type") or "").lower().replace("_","-")
+        s = _safe_abs_sec(e)
+        d = e.get("details") or {}
+        oi = e.get("onice") or {}
+        home_pre = set(int(x) for x in (oi.get("home") or []))
+        away_pre = set(int(x) for x in (oi.get("away") or []))
+        # Always retain personal events for later per-player credit
+        if t in ("hit","giveaway","takeaway"):
+            events_by_sec[s].append({"type": t, "details": d})
+        # Only proceed with team attempt/goal credit for shots/goals
+        if t not in SHOT_TYPES and t not in GOAL_TYPES:
             continue
-            det = ev.get("details") or {}
 
-            # micro
-            if et in ("giveaway", "takeaway"):
-                pid = det.get("playerId") or det.get("player_id") or det.get("actorPlayerId")
-                pid = _safe_int(pid, default=0)
-                if pid:
-                    # store on credit bucket later in token aggregation; here only keep event list
-                    pass
+        credit_by_sec[s]["onice_home"] = home_pre
+        credit_by_sec[s]["onice_away"] = away_pre
+        credit_by_sec[s]["owner_team_id"] = d.get("eventOwnerTeamId")
 
-            # shots / goals
-            if et in SHOT_TYPES or et in GOAL_TYPES:
-                if et in BLOCK_TYPES and str(det.get("reason", "")).lower() == "teammate-blocked":
-                    continue
-                side = _owner_side_for_event(det, game.home_team_id, game.away_team_id)
-                if side not in ("home", "away"):
-                    continue
-                opp = "away" if side == "home" else "home"
+        # keep a minimal record of the event (shots/blocks/goals) for per-player crediting later
+        events_by_sec[s].append({"type": t, "details": d})
 
-                # attempts for owner
-                cb[side]["AF"] += 1
-                cb[opp]["AA"] += 1
+        side = _owner_side_for_event(d, home_pre, away_pre)  # 'home' / 'away' / None
+        opp  = "away" if side == "home" else ("home" if side == "away" else None)
 
-                # shots on goal for owner
-                if et in SHOT_ON_GOAL_TYPES or et in GOAL_TYPES:
-                    cb[side]["SF"] += 1
-                    cb[opp]["SA"] += 1
+        if t in SHOT_TYPES:
+            # All attempts (including on-goal/miss/block) count toward AF/AA
+            # On-target (saved shots + goals) additionally count SF/SA and xG
+            xg = float(d.get("xg", 0.0)) if d.get("xg") is not None else 0.0
+            if side in ("home","away") and opp is not None:
+                # attempts
+                credit_by_sec[s][side]["AF"] += 1
+                credit_by_sec[s][opp ]["AA"] += 1
 
-                # goals (dedupe by (sec, owner team, scorer))
-                if et in GOAL_TYPES:
-                    owner_tid = det.get("eventOwnerTeamId")
-                    scorer = det.get("scoringPlayerId") or det.get("shootingPlayerId")
-                    goal_key = (s, owner_tid, scorer)
-                    if goal_key in seen_goal_keys:
-                        continue
-                    seen_goal_keys.add(goal_key)
-                    cb[side]["GF"] += 1
-                    cb[opp]["GA"] += 1
+                # on-target: saved shot or goal
+                if (t in SHOT_ON_GOAL_TYPES) or (t in GOAL_TYPES):
+                    credit_by_sec[s][side]["SF"] += 1
+                credit_by_sec[s][opp]["SA"] += 1
+                credit_by_sec[s][side]["xGF"] += xg
+                credit_by_sec[s][opp]["xGA"] += xg
 
-                # blocked-for/against: attribute by defender side if blocker is known onice
-                if et in BLOCK_TYPES:
-                    blk_pid = det.get("blockingPlayerId") or det.get("blockedByPlayerId") or det.get("blockerPlayerId") or det.get("blockerId")
+                # block attribution: use blocker if available; else fallback to defender side
+                if t in BLOCK_TYPES:
+                    # try to detect blocker player id from various key names
+                    det = d.get("details") or {}
+                    blk_pid = (
+                        det.get("blockingPlayerId")
+                        or det.get("blockedByPlayerId")
+                        or det.get("blockerPlayerId")
+                        or det.get("blockerId")
+                    )
+                    blocker_side: Optional[str] = None
                     try:
                         blk_pid = int(blk_pid) if blk_pid is not None else None
                     except Exception:
                         blk_pid = None
-                    defender_side = None
                     if blk_pid is not None:
-                        if blk_pid in home_ids:
-                            defender_side = "home"
-                        elif blk_pid in away_ids:
-                            defender_side = "away"
-                    if defender_side is None:
-                        defender_side = opp
-                    attacker_side = "away" if defender_side == "home" else "home"
-                    cb[defender_side]["BF"] += 1
-                    cb[attacker_side]["BA"] += 1
+                        if blk_pid in home_pre:
+                            blocker_side = "home"
+                        elif blk_pid in away_pre:
+                            blocker_side = "away"
+                    # Fallback: blocked shots are by the defending team (opposite of shooter/owner)
+                    if blocker_side is None:
+                        blocker_side = opp  # defender side opposes owner/shooter side
+                    defender_side = blocker_side
+                    attacker_side = "home" if defender_side == "away" else "away"
+                    credit_by_sec[s][defender_side]["BF"] += 1
+                    credit_by_sec[s][attacker_side]["BA"] += 1
+            else:
+                # No side resolved: skip attempt credit to avoid over-attribution
+                pass
 
-        credit_by_sec[s] = cb
+        elif t in GOAL_TYPES:
+            # >>> NEW: only count one goal per (second, owner team, scorer)
+            owner_tid = d.get("eventOwnerTeamId")
+            scorer = d.get("scoringPlayerId") or d.get("shootingPlayerId")
+            goal_key = (s, owner_tid, scorer)
+            if goal_key in seen_goal_keys:
+                continue
+            seen_goal_keys.add(goal_key)
 
-        # cum goals
-        cum_home_goals[s + 1] = cum_home_goals[s] + int(cb["home"].get("GF", 0))
-        cum_away_goals[s + 1] = cum_away_goals[s] + int(cb["away"].get("GF", 0))
+            if side in ("home","away") and opp is not None:
+                credit_by_sec[s][side]["GF"] += 1
+                credit_by_sec[s][opp]["GA"]  += 1
+            else:
+                # No side resolved: skip goal credit
+                pass
+    # --- end directional pre-index ---
 
-    return credit_by_sec, cum_home_goals, cum_away_goals
+    # --- cumulative score up to (and including) each second ---
+    horizon = len(team_onice_by_sec) - 1
+    cum_home_goals = [0] * (horizon + 2)
+    cum_away_goals = [0] * (horizon + 2)
+    for s in range(horizon + 1):
+        cum_home_goals[s+1] = cum_home_goals[s]
+        cum_away_goals[s+1] = cum_away_goals[s]
+        cb = credit_by_sec.get(s)
+        if cb:
+            if int(cb["home"].get("GF", 0)) > 0:
+                cum_home_goals[s+1] += int(cb["home"]["GF"])
+            if int(cb["away"].get("GF", 0)) > 0:
+                cum_away_goals[s+1] += int(cb["away"]["GF"])
 
+    def score_at_start(start_sec: int) -> Tuple[int,int]:
+        # goals BEFORE this window start
+        return cum_home_goals[start_sec], cum_away_goals[start_sec]
 
-def build_windows(
-    game: ParsedGame,
-    team_onice_by_sec: List[Tuple[List[int], List[int]]],
-    goalie_ids_by_sec: List[Dict[str, int]],
-    events_by_sec: Dict[int, List[Dict[str, Any]]],
-    orders_by_sec: Dict[int, List[Tuple[int, str]]],
-    sso_by_sec: Dict[int, List[Tuple[int, str]]],
-    shift_changes_by_sec: Dict[int, Dict[str, set]],
-    end_event_at: Dict[int, Dict[str, Any]],
-    fo_meta: Dict[int, Dict[str, Any]],
-    tv_timeout_secs: set,
-    horizon: int,
-    hard_cap_sec: int,
-) -> List[Dict[str, Any]]:
-    # strength_global: based on skater counts + goalie presence by second
-    def strength_at(sec: int) -> str:
-        sec = max(0, min(sec, horizon))
-        h_ids, a_ids = team_onice_by_sec[sec]
-        gh = _safe_int(goalie_ids_by_sec[sec].get("home", 0))
-        ga = _safe_int(goalie_ids_by_sec[sec].get("away", 0))
-        gh_present = 1 if gh != 0 else 0
-        ga_present = 1 if ga != 0 else 0
-        # Preserve full state for CIN / EN regimes
-        # Canonical encoding: "{home_skaters}v{away_skaters}_GH{0/1}_GA{0/1}"
-        return f"{len(h_ids)}v{len(a_ids)}_GH{gh_present}_GA{ga_present}"
+    def score_diff_for_side(side: str, start_sec: int) -> int:
+        h, a = score_at_start(start_sec)
+        return (h - a) if side == "home" else (a - h)
 
-    # breaks: natural + faceoffs
-    break_secs: set = set()
-    for s, ev in end_event_at.items():
-        et = str(ev.get("type") or "").lower()
-        if et in ("goal", "penalty", "stoppage", "goalie-stopped", "timeout", "challenge"):
-            break_secs.add(int(s))
-    # also treat faceoffs as breaks (if no natural break at same second, faceoff will flush)
-    for s in fo_meta.keys():
-        break_secs.add(int(s))
+    def clock_s_at(start_sec: int) -> int:
+        return start_sec % SECONDS_PER_PERIOD
 
-    windows: List[Dict[str, Any]] = []
-
+    windows: List[Dict[str,Any]] = []
     open_s = 0
     last_strength = strength_at(0)
     last_home, last_away = team_onice_by_sec[0]
-
     last_fo_zone: Optional[str] = None
     last_fo_winner_team_id: Optional[int] = None
     last_fo_winner_player_id: Optional[int] = None
     last_fo_loser_player_id: Optional[int] = None
-
+    # Break metadata to carry into the NEXT window's start
     last_break_type: Optional[str] = None
     last_break_team_id: Optional[int] = None
     last_break_subtype: Optional[str] = None
+    last_media_timeout: bool = False
+    media_timeout_next_flag: bool = False
     media_timeout_tag_start_sec: Optional[int] = None
 
     if 0 in fo_meta:
@@ -1143,41 +749,46 @@ def build_windows(
         last_fo_loser_player_id = fo_meta[0].get("losingPlayerId")
 
     def flush(end_s: int, reason: str):
-        nonlocal open_s, last_strength, last_home, last_away, last_fo_zone, last_fo_winner_team_id, last_fo_winner_player_id, last_fo_loser_player_id
-        nonlocal last_break_type, last_break_team_id, last_break_subtype, media_timeout_tag_start_sec
+        nonlocal open_s, last_strength, last_home, last_away, last_fo_zone, last_fo_winner_team_id, last_fo_winner_player_id, last_fo_loser_player_id, last_break_type, last_break_team_id, last_break_subtype, last_media_timeout, media_timeout_next_flag, media_timeout_tag_start_sec
         if end_s <= open_s:
             return
-        home_end, away_end = team_onice_by_sec[max(0, min(end_s - 1, horizon))]
-        # Snapshot goalie presence at window start (for instruments)
-        gh0 = _safe_int(goalie_ids_by_sec[open_s].get("home", 0)) if open_s < len(goalie_ids_by_sec) else 0
-        ga0 = _safe_int(goalie_ids_by_sec[open_s].get("away", 0)) if open_s < len(goalie_ids_by_sec) else 0
+        start_goalies = goalies_by_team[open_s]
+        start_goalie_ids = goalie_ids_by_sec[open_s] if open_s < len(goalie_ids_by_sec) else {"home":0,"away":0}
+        end_goalies   = goalies_by_team[max(0, min(end_s-1, horizon))]
+        home_end, away_end = team_onice_by_sec[max(0, min(end_s-1, horizon))]
         w = {
-            "window_id": f"W{len(windows) + 1:04d}",
+            "window_id": f"W{len(windows)+1:04d}",
             "period": period_of(open_s),
-            "start_sec": int(open_s),
-            "end_sec": int(end_s),
-            "duration": int(end_s - open_s),
+            "start_sec": open_s,
+            "end_sec": end_s,
+            "duration": end_s - open_s,
             "clock_start": clock_str(open_s),
             "strength_global": last_strength,
-            # goalie pull flags (instrumental; do not collapse into strength_global only)
-            "home_goalie_present": int(1 if gh0 != 0 else 0),
-            "away_goalie_present": int(1 if ga0 != 0 else 0),
-            "home_goalie_pulled": int(1 if gh0 == 0 else 0),
-            "away_goalie_pulled": int(1 if ga0 == 0 else 0),
             "fo_zone": last_fo_zone or "flow",
             "fo_won_team_id": last_fo_winner_team_id,
             "fo_won_player_id": last_fo_winner_player_id,
             "fo_lost_player_id": last_fo_loser_player_id,
+            # start-of-window previous break metadata
             "start_prev_break_type": (last_break_type or "period_start"),
             "start_prev_break_team_id": last_break_team_id,
             "start_prev_break_subtype": last_break_subtype,
+            # Stamp only if the armed tag matches this window's start second
             "media_timeout_start": int(1 if (media_timeout_tag_start_sec is not None and media_timeout_tag_start_sec == open_s) else 0),
             "end_event_type": reason,
             "home_ids_start": list(last_home),
             "away_ids_start": list(last_away),
             "home_ids_end": list(home_end),
             "away_ids_end": list(away_end),
+            "goalies_start": {"home": start_goalies["home"], "away": start_goalies["away"]},
+            "goalie_ids_start": {"home": int(start_goalie_ids.get("home",0)), "away": int(start_goalie_ids.get("away",0))},
+            "goalies_end":   {"home": end_goalies["home"],   "away": end_goalies["away"]},
         }
+        # delayed-penalty flag: must be under delayed-penalty, end with penalty, and have a pulled goalie (either side) during the window
+        dp_active_in_window = any(delayed_active_by_sec[s_] for s_ in range(open_s, end_s))
+        pulled_any_in_window = any((pulled_home[s_] or pulled_away[s_]) for s_ in range(open_s, end_s))
+        w["delayed_penalty"] = int(bool(dp_active_in_window and (reason == "penalty") and pulled_any_in_window))
+        if reason == "faceoff" and end_s in fo_meta:
+            w["fo_zone_next"] = fo_meta[end_s]["zone"]
         windows.append(w)
 
         open_s = end_s
@@ -1187,37 +798,45 @@ def build_windows(
         last_fo_winner_team_id = None
         last_fo_winner_player_id = None
         last_fo_loser_player_id = None
+        # consume the carry tag if we just stamped it
         if media_timeout_tag_start_sec is not None and media_timeout_tag_start_sec == open_s:
+            media_timeout_next_flag = False
             media_timeout_tag_start_sec = None
+        # do not clear last_break_* here; it should carry to the next window start until overwritten
 
-    # NOTE: `sec == horizon` is a sentinel snapshot (we keep arrays sized horizon+1).
-    # Do not let that sentinel second create synthetic "strength" breaks; period end
-    # should be labeled as `period_end` via the final flush below.
     s = 1
-    while s < horizon:
+    while s <= horizon:
         cur_strength = strength_at(s)
         elapsed = s - open_s
 
-        # natural break first
-        ev = end_event_at.get(s)
-        if ev is not None:
-            et = str(ev.get("type") or "").lower()
-            if et in ("goal", "penalty", "stoppage", "goalie-stopped", "timeout", "challenge"):
-                det = ev.get("details") or {}
-                sub_reason = str(det.get("reason") or det.get("stoppageReason") or "").lower()
-                reason = "icing" if (et in {"stoppage", "goalie-stopped"} and sub_reason == "icing") else et
-                by_tid = det.get("byTeamId") or det.get("teamId") or det.get("committingTeamId") or det.get("eventOwnerTeamId")
+        # 1) natural break first (goal/penalty beats faceoff at same second)
+        if s in break_secs:
+            base_type = (end_event_at.get(s, {}).get("type") or "stoppage")
+            # capture team causing the whistle if available and sub-reason for stoppages (e.g., icing)
+            dmeta = (end_event_at.get(s, {}) or {}).get("details") or {}
+            sub_reason = str(dmeta.get("reason") or dmeta.get("stoppageReason") or "").lower()
+            # Effective reason: if it's a stoppage with reason "icing", treat as icing
+            reason = ("icing" if (base_type in {"stoppage","goalie-stopped"} and sub_reason == "icing") else base_type)
+            by_tid = dmeta.get("byTeamId") or dmeta.get("teamId") or dmeta.get("committingTeamId") or dmeta.get("eventOwnerTeamId")
             try:
                 by_tid = int(by_tid) if by_tid is not None else None
             except Exception:
                 by_tid = None
-
             flush(s, reason)
+            # record break for NEXT window start
             last_break_type = reason
             last_break_team_id = by_tid
-                last_break_subtype = sub_reason if et in {"stoppage", "goalie-stopped"} else None
+            # subtype and media timeout
+            last_break_subtype = sub_reason if base_type in {"stoppage","goalie-stopped"} else None
+            last_media_timeout = (s in tv_timeout_secs) or ("tv" in sub_reason or "media" in sub_reason or "commercial" in sub_reason)
+            # Strict rule: stamp ONLY if explicit sec is in tv_timeout_secs
+            # The start_sec for the next window must equal s
             if s in tv_timeout_secs:
+                media_timeout_next_flag = True
                 media_timeout_tag_start_sec = s
+            else:
+                media_timeout_next_flag = False
+                media_timeout_tag_start_sec = None
             if s in fo_meta:
                 last_fo_zone = fo_meta[s]["zone"]
                 last_fo_winner_team_id = fo_meta[s].get("eventOwnerTeamId")
@@ -1226,12 +845,14 @@ def build_windows(
             s += 1
             continue
 
-        # faceoff-only break
+        # 2) pure faceoff-only break
         if s in fo_meta:
             flush(s, "faceoff")
+            # mark the faceoff as the break that precedes NEXT window
             last_break_type = "faceoff"
             last_break_team_id = None
             last_break_subtype = None
+            last_media_timeout = False
             last_fo_zone = fo_meta[s]["zone"]
             last_fo_winner_team_id = fo_meta[s].get("eventOwnerTeamId")
             last_fo_winner_player_id = fo_meta[s].get("winningPlayerId")
@@ -1252,193 +873,1184 @@ def build_windows(
         s += 1
 
     flush(horizon, "period_end")
-    return windows
 
+    # (Removed) delayed-penalty tagging per request
+    delayed_penalty_windows = set()
 
-def aggregate_features_for_token(
-    *,
-    game: "ParsedGame",
-    by_sec_home: Dict[int, set],
-    by_sec_away: Dict[int, set],
-    events_by_sec: Dict[int, List[Dict[str, Any]]],
-    credit_by_sec: Dict[int, Dict[str, Any]],
-    team_onice_by_sec: List[Tuple[List[int], List[int]]],
-    orders_by_sec: Dict[int, List[Tuple[int, str]]],
-    shift_changes_by_sec: Dict[int, Dict[str, set]],
+    # helpers for cameo protection
+    def second_has_credit_event(sec: int) -> bool:
+        cb = credit_by_sec.get(sec)
+        return bool(cb and (cb["home"] or cb["away"]))
+
+    def protective_has_event(sec: int, window_start_sec: int, window_end_sec: int) -> bool:
+        if second_has_credit_event(sec):
+            return True
+        tset = types_by_sec.get(sec, set())
+        if tset & MICRO_PROTECT_TYPES:
+            return True
+        if sec == window_start_sec and "faceoff" in tset:
+            return True
+        # end-edge protection: protect last included sec only if end_sec has a credited event BEFORE any faceoff
+        if sec == window_end_sec - 1 and has_credit_before_faceoff(window_end_sec):
+            return True
+        return False
+
+    # Track forced cameo drops when a goal participant swap triggers
+    forced_drop_cameo_by_sec_side: Dict[Tuple[int, str], set] = defaultdict(set)
+
+    def _maybe_correct_onice_for_goal(
+        sec: int,
+        ev: Dict[str, Any],
+        pre_home_set: set,
+        pre_away_set: set,
+    ) -> Tuple[set, set]:
+        """Apply a tiny jitter correction for goals.
+        - Respect sortOrder inside the second: if a shift-change has lower sortOrder than the goal
+          and that creates a conflict, treat the shift as after the goal.
+        - If a credited skater (scorer/assisters) is missing from the on-ice snapshot, look back 1s.
+          If present there, and someone else replaced him now, perform a single 1-for-1 swap for crediting.
+        """
+        try:
+            det = ev.get("details") or {}
+            goal_so = int(ev.get("sortOrder", 0))
+        except Exception:
+            det = ev.get("details") or {}
+            goal_so = 0
+
+        # Determine team side from owner team id if available
+        owner_tid = det.get("eventOwnerTeamId")
+        side_local: Optional[str] = None
+        try:
+            if owner_tid is not None and home_team_id is not None and int(owner_tid) == int(home_team_id):
+                side_local = "home"
+            elif owner_tid is not None and away_team_id is not None and int(owner_tid) == int(away_team_id):
+                side_local = "away"
+        except Exception:
+            side_local = None
+
+        # Base sets we will possibly adjust
+        base_home = set(pre_home_set)
+        base_away = set(pre_away_set)
+
+        # If a same-second shift-change occurs before the goal OR there was any shift at sec-1,
+        # use the most recent prior snapshot before that change, scanning back for a stable 5v5 if possible.
+        use_prior_snapshot = False
+        start_prev = sec - 1
+        try:
+            evs_this = orders_by_sec.get(sec, [])
+            same_sec_shift_before = any((t == "shift-change" and so < goal_so) for so, t in evs_this)
+        except Exception:
+            same_sec_shift_before = False
+        try:
+            tminus1_has_shift = bool(shift_changes_by_sec.get(sec - 1)) if sec - 1 >= 0 else False
+        except Exception:
+            tminus1_has_shift = False
+        if same_sec_shift_before or tminus1_has_shift:
+            use_prior_snapshot = True
+            start_prev = sec - 2 if tminus1_has_shift else sec - 1
+        if use_prior_snapshot:
+            lookback = 0
+            prev_s = start_prev
+            while prev_s >= 0 and lookback < 30:
+                if prev_s < len(team_onice_by_sec):
+                    ph, pa = team_onice_by_sec[prev_s]
+                    # Prefer frames with 5 skaters per side; accept first available otherwise
+                    if (len(ph) >= 5 and len(pa) >= 5) or lookback == 0:
+                        base_home = set(ph)
+                        base_away = set(pa)
+                        if len(ph) >= 5 and len(pa) >= 5:
+                            break
+                prev_s -= 1
+                lookback += 1
+
+        # Also handle the jitter: if an assist/scorer was subbed off shortly before and replaced now, swap back
+        try:
+            sc_prev = shift_changes_by_sec.get(sec - 1, {}) if sec - 1 >= 0 else {}
+            sc_now = shift_changes_by_sec.get(sec, {})
+        except Exception:
+            sc_prev, sc_now = {}, {}
+
+        # Participant override: ensure scorer/assist(1/2) are on for the goal team
+        parts: List[int] = []
+        for k in ("scoringPlayerId", "assist1PlayerId", "assist2PlayerId"):
+            v = det.get(k)
+            try:
+                if v is not None:
+                    parts.append(int(v))
+            except Exception:
+                continue
+
+        if parts:
+            if side_local is None:
+                # Fall back to owner_side detection using current bases
+                side_local = _owner_side_for_event(det, list(base_home), list(base_away))
+            # Work on the goal-side set only; allow a single swap
+            goal_set = base_home if side_local == "home" else base_away if side_local == "away" else None
+            opp_set  = base_away if side_local == "home" else base_home if side_local == "away" else None
+            if isinstance(goal_set, set):
+                # find first missing participant
+                missing = None
+                for pid in parts:
+                    if pid not in goal_set:
+                        missing = pid
+                        break
+                # Look back up to 3 seconds for the missing credited skater
+                if missing is not None:
+                    prev_side_set = None
+                    for back in range(1, 4):
+                        s_prev = sec - back
+                        if s_prev < 0 or s_prev >= len(team_onice_by_sec):
+                            continue
+                        prev_home, prev_away = team_onice_by_sec[s_prev]
+                        prev_side_tmp = set(prev_home) if side_local == "home" else set(prev_away)
+                        if missing in prev_side_tmp:
+                            prev_side_set = prev_side_tmp
+                            break
+                    if prev_side_set is not None:
+                        # choose a cameo present now but not in the prev snapshot
+                        cand_out = None
+                        now_in_key = ("home_in" if side_local == "home" else "away_in")
+                        prev_out_key = ("home_out" if side_local == "home" else "away_out")
+                        now_in = set((sc_now or {}).get(now_in_key, set()))
+                        prev_out = set((sc_prev or {}).get(prev_out_key, set()))
+                        for pid_now in list(goal_set):
+                            if pid_now not in prev_side_set and (pid_now in now_in or pid_now in prev_out or True):
+                                cand_out = pid_now
+                                break
+                        if cand_out is not None:
+                            try:
+                                goal_set.discard(cand_out)
+                                goal_set.add(missing)
+                                forced_drop_cameo_by_sec_side[(sec, side_local)].add(int(cand_out))
+                            except Exception:
+                                pass
+                # write back
+                if side_local == "home":
+                    base_home = goal_set
+                elif side_local == "away":
+                    base_away = goal_set
+
+        return base_home, base_away
+
+    # Map rink faceoff zone to team-relative zone_start label using FO owner team id
+    def zone_start_for(team_side: str,
+                       fo_zone: Optional[str],
+                       owner_team_id: Optional[int],
+                       home_tid: Optional[int],
+                       away_tid: Optional[int]) -> str:
+        z = (fo_zone or "flow").upper()
+        if z == "FLOW":
+            return "flow"
+        if z == "N":
+            return "NZ"
+        # determine which side (home/away) owns the FO per eventOwnerTeamId
+        owner_side: Optional[str] = None
+        try:
+            if owner_team_id is not None and home_tid is not None and away_tid is not None:
+                if int(owner_team_id) == int(home_tid):
+                    owner_side = "home"
+                elif int(owner_team_id) == int(away_tid):
+                    owner_side = "away"
+        except Exception:
+            owner_side = None
+        if z == "O":
+            # Offensive zone for the owner; defender is DZ
+            if owner_side is None:
+                return "flow"
+            return "OZ" if team_side == owner_side else "DZ"
+        if z == "D":
+            # Defensive zone for the owner; opponent is OZ
+            if owner_side is None:
+                return "flow"
+            return "DZ" if team_side == owner_side else "OZ"
+        return "flow"
+
+    # Team-relative after-icing instrument
+    def after_icing_for_side(start_break_type: Optional[str],
+                             start_break_team_id: Optional[int],
                              side: str,
-    p: int,
-    win_start: int,
-    win_end: int,
-    t_token: int,
-    t_end: int,
-) -> Dict[str, Any]:
-    """
-    Recompute ALL outcome/target features over the token horizon (t_token, t_end] clipped to window end,
-    credited only at seconds where player p is on-ice (per-second snapshots).
-    """
-    start_target = max(int(win_start), int(t_token) + 1)
-    end_target = min(int(t_end), int(win_end))
-    if end_target < start_target:
-        return {k: 0 for k in (
-            "xGF","xGA","GF","GA","SF","SA","AF","AA","BF","BA",
-            "giveaways_committed","takeaways_forced","hits_personal","blocks_personal","shots_blocked_personal",
-            "giveaways_committed_oz","giveaways_committed_nz","giveaways_committed_dz",
-            "takeaways_forced_oz","takeaways_forced_nz","takeaways_forced_dz",
-            "hits_personal_oz","hits_personal_nz","hits_personal_dz",
-            "blocks_personal_oz","blocks_personal_nz","blocks_personal_dz",
-            "shots_blocked_personal_oz","shots_blocked_personal_nz","shots_blocked_personal_dz",
-        )} | {
-            # True exposure for outcome heads: number of seconds in (t_token, t_end] where player is on-ice.
-            # NOTE: This can be < seconds_token if the player exits before t_end (important for offsets/rate models).
-            "seconds_onice_in_h": 0,
-            # POST-horizon overlap evidence (DO NOT use as PRE/CIN inputs)
-            "post_teammates_onice_ids_w": [], "post_teammates_onice_w": [], "post_teammates_onice_sec_w": [], "post_teammates_onice_share_raw": [],
-            "post_opponents_onice_ids_w": [], "post_opponents_onice_w": [], "post_opponents_onice_sec_w": [], "post_opponents_onice_share_raw": [],
-            "post_with_event_GF": [], "post_with_event_GA": [], "post_with_event_SF": [], "post_with_event_SA": [],
-        }
+                             home_team_id: Optional[int],
+                             away_team_id: Optional[int],
+                             fo_zone: Optional[str]) -> bool:
+        # Simplest rule as requested: if previous break was icing, flag True
+        return (str(start_break_type or "").lower() == "icing")
 
-    onice_map = by_sec_home if side == "home" else by_sec_away
-    opp_map = by_sec_away if side == "home" else by_sec_home
+    # --- Standings/schedule helpers (best-effort) ---
+    def _load_csv_rows(path: str) -> List[Dict[str, Any]]:
+        try:
+            import csv
+            with open(path, "r", encoding="utf-8") as f:
+                return list(csv.DictReader(f))
+        except Exception:
+            return []
 
-    Y = Counter()
-    xgF = 0.0
-    xgA = 0.0
+    def _find_standings_dir() -> Optional[str]:
+        # 1) explicit CLI
+        if CLI_STANDINGS_DIR and os.path.isdir(CLI_STANDINGS_DIR):
+            if debug_standings:
+                print({"debug":"standings","found_dir_explicit": CLI_STANDINGS_DIR})
+            return CLI_STANDINGS_DIR
+        # 2) near input raw (../standings)
+        try:
+            in_dir = os.path.abspath(os.path.dirname(CLI_IN_PATH)) if CLI_IN_PATH else None
+            raw_dir = os.path.dirname(in_dir)
+            rel_dir = os.path.join(raw_dir, "standings")
+            if os.path.isdir(rel_dir):
+                if debug_standings:
+                    print({"debug":"standings","found_dir_relative": rel_dir})
+                return rel_dir
+        except Exception:
+            pass
+        # 3) fallbacks under artifacts
+        for rel in (
+            os.path.join("artifacts","dumps","raw","standings"),
+            os.path.join("artifacts","dumps2","raw","standings"),
+        ):
+            if os.path.isdir(rel):
+                if debug_standings:
+                    print({"debug":"standings","found_dir": rel})
+                return rel
+        return None
 
-    gv_p = tk_p = hp_p = bp_p = sbp_p = 0
-    gv_zone = {zb: 0 for zb in ZONE_BUCKETS}
-    tk_zone = {zb: 0 for zb in ZONE_BUCKETS}
-    hp_zone = {zb: 0 for zb in ZONE_BUCKETS}
-    bp_zone = {zb: 0 for zb in ZONE_BUCKETS}
-    sbp_zone = {zb: 0 for zb in ZONE_BUCKETS}
+    def _lower_keys(row: Dict[str, Any]) -> Dict[str, Any]:
+        return {str(k).lower(): v for k, v in row.items()}
 
-    overlap_with: Counter[int] = Counter()
-    overlap_vs: Counter[int] = Counter()
-    event_copres_with: Dict[int, Counter] = defaultdict(Counter)
+    def _parse_date_any(val: Any) -> Optional[str]:
+        s = str(val or "").strip()
+        if not s:
+            return None
+        # accept YYYY-MM-DD or full ISO
+        if len(s) >= 10:
+            return s[:10]
+        return None
 
-    # IMPORTANT: include end_target (inclusive) for (t_token, t_end]
-    for s in range(int(start_target), int(end_target) + 1):
-        if p not in onice_map.get(int(s), ()):
+    # discover game date (best-effort from root metadata)
+    game_date_str: Optional[str] = None
+    try:
+        root_game = evts_sorted[0].get("game", {})
+        for key in ("date","gameDate","startTimeUTC","game_date"):
+            if root_game.get(key):
+                game_date_str = _parse_date_any(root_game.get(key))
+                if debug_standings:
+                    print({"debug":"standings","source":"pbp_root","key": key, "game_date": game_date_str})
+                    break
+    except Exception:
+        game_date_str = None
+
+    _standings_cache: Dict[Tuple[int,str], Tuple[Optional[int], Optional[bool], Optional[int]]] = {}
+
+    def compute_standings_and_b2b(team_id: Optional[int]) -> Tuple[Optional[int], Optional[bool], Optional[int]]:
+        if not isinstance(team_id, int):
+            if debug_standings:
+                print({"debug":"standings","error":"team_id_missing", "team_id": team_id})
+            return None, None, None
+        standings_dir = _find_standings_dir()
+        if not standings_dir:
+            if debug_standings:
+                print({"debug":"standings","error":"standings_dir_not_found"})
+            return None, None, None
+        # Determine game date from game_results by gamePk if not already set
+        nonlocal game_date_str
+        gdate = game_date_str
+        # Prefer the explicit filenames provided by user, then fallback to scanning
+        explicit_game_results = os.path.join(standings_dir, "game_results_20242025.csv")
+        explicit_by_date = os.path.join(standings_dir, "standings_by_date_20242025.csv")
+        explicit_after_each = os.path.join(standings_dir, "standings_after_each_game_20242025.csv")
+        # 1) Resolve game date
+        try:
+            used_game_results_files: List[str] = []
+            if os.path.exists(explicit_game_results):
+                used_game_results_files.append(explicit_game_results)
+            else:
+                # fallback: any game_results_*.csv in dir
+                for name in os.listdir(standings_dir):
+                    if "game_results" in name and name.endswith(".csv"):
+                        used_game_results_files.append(os.path.join(standings_dir, name))
+            for path in used_game_results_files:
+                rows = _load_csv_rows(path)
+                if debug_standings:
+                    print({"debug":"standings","scan":"game_results","file": os.path.basename(path), "rows": len(rows)})
+                for r in rows:
+                    lr = _lower_keys(r)
+                    gp = lr.get("gamepk") or lr.get("game_pk") or lr.get("gameid")
+                    try:
+                        gp = int(gp) if gp is not None else None
+                    except Exception:
+                        gp = None
+                    if gp is not None and game_pk_local is not None and gp == int(game_pk_local):
+                        gd = _parse_date_any(lr.get("date") or lr.get("game_date") or lr.get("gamedate"))
+                        if gd:
+                            gdate = gd
+                            game_date_str = gd
+                            if debug_standings:
+                                print({"debug":"standings","resolved_game_date_from":"game_results","file": os.path.basename(path), "gamePk": int(game_pk_local), "game_date": gd})
+                break
+                if gdate:
+                    break
+        except Exception:
+            pass
+
+        cache_key = (team_id, gdate or "")
+        if cache_key in _standings_cache:
+            if debug_standings:
+                print({"debug":"standings","cache_hit": True, "team_id": team_id, "game_date": gdate})
+            return _standings_cache[cache_key]
+
+        # Build team game dates for rest/B2B
+        dates_for_team: List[str] = []
+        try:
+            used_game_results_files: List[str] = []
+            if os.path.exists(explicit_game_results):
+                used_game_results_files.append(explicit_game_results)
+            else:
+                for name in os.listdir(standings_dir):
+                    if "game_results" in name and name.endswith(".csv"):
+                        used_game_results_files.append(os.path.join(standings_dir, name))
+            for path in used_game_results_files:
+                rows = _load_csv_rows(path)
+                if debug_standings:
+                    print({"debug":"standings","team_dates_scan":"game_results","file": os.path.basename(path), "rows": len(rows)})
+                for r in rows:
+                    lr = _lower_keys(r)
+                    d = _parse_date_any(lr.get("date") or lr.get("game_date") or lr.get("gamedate"))
+                    if not d:
+                        continue
+                    matched = False
+                    # flexible team id matching
+                    for key in ("team_id","teamid","team"):
+                        try:
+                            vv = lr.get(key)
+                            if vv is not None and int(vv) == team_id:
+                                matched = True
+                                break
+                        except Exception:
+                            pass
+                    if not matched:
+                        for key in ("home_team_id","away_team_id","hometeamid","awayteamid","home_id","away_id"):
+                            try:
+                                vv = lr.get(key)
+                                if vv is not None and int(vv) == team_id:
+                                    matched = True
+                                    break
+                            except Exception:
+                                pass
+                    if matched:
+                        dates_for_team.append(d)
+        except Exception:
+            pass
+        dates_for_team = sorted(set(dates_for_team))
+        rest_days: Optional[int] = None
+        b2b: Optional[bool] = None
+        if gdate and dates_for_team:
+            from datetime import datetime
+            try:
+                gd = datetime.strptime(gdate, "%Y-%m-%d").date()
+                prev = None
+                for d in dates_for_team:
+                    if d < gdate:
+                        prev = d
+                if prev is not None:
+                    pd = datetime.strptime(prev, "%Y-%m-%d").date()
+                    diff = (gd - pd).days
+                    rest_days = diff
+                    b2b = (diff == 1)
+                    if debug_standings:
+                        print({"debug":"standings","team_id": team_id, "prev_date": str(pd), "game_date": str(gd), "rest_days": rest_days, "b2b": b2b})
+                else:
+                    # First game of season for this team: treat as long rest and not B2B
+                    rest_days = 999
+                    b2b = False
+                    if debug_standings:
+                        print({"debug":"standings","team_id": team_id, "first_game": True, "game_date": str(gd), "rest_days": rest_days, "b2b": b2b})
+            except Exception:
+                pass
+
+        # standing prior: from standings_by_date (preferred)
+        standing_prior: Optional[int] = None
+        try:
+            used_by_date_files: List[str] = []
+            if os.path.exists(explicit_by_date):
+                used_by_date_files.append(explicit_by_date)
+            else:
+                for name in os.listdir(standings_dir):
+                    if "standings_by_date" in name and name.endswith(".csv"):
+                        used_by_date_files.append(os.path.join(standings_dir, name))
+            for path in used_by_date_files:
+                rows = _load_csv_rows(path)
+                if not rows:
+                    continue
+                # choose exact game date; if not found, choose max date <= game date
+                best_date = None
+                for r in rows:
+                    lr = _lower_keys(r)
+                    d = _parse_date_any(lr.get("date") or lr.get("game_date"))
+                    if not d:
+                        continue
+                    tid = lr.get("team_id") or lr.get("teamid") or lr.get("team")
+                    try:
+                        tid = int(tid) if tid is not None else None
+                    except Exception:
+                        tid = None
+                    if tid != team_id:
+                        continue
+                    if gdate and d == gdate:
+                        best_date = d
+                        break
+                    if gdate and d < gdate:
+                        best_date = d
+                if best_date:
+                    if debug_standings:
+                        print({"debug":"standings","file": os.path.basename(path), "best_date": best_date, "team_id": team_id})
+                    # get rank on best_date
+                    for r in rows:
+                        lr = _lower_keys(r)
+                        d = _parse_date_any(lr.get("date") or lr.get("game_date"))
+                        if d != best_date:
+                            continue
+                        tid = lr.get("team_id") or lr.get("teamid") or lr.get("team")
+                        try:
+                            tid = int(tid) if tid is not None else None
+                        except Exception:
+                            tid = None
+                        if tid != team_id:
+                            continue
+                        rank_val = (
+                            lr.get("rank") or lr.get("standing") or lr.get("standing_rank")
+                            or lr.get("rank_overall") or lr.get("league_rank") or lr.get("league_rank_unique")
+                        )
+                        try:
+                            standing_prior = int(rank_val)
+                        except Exception:
+                            standing_prior = None
+                        break
+                if standing_prior is not None:
+                    break
+        except Exception:
+            pass
+
+        # Fallback: standings_after_each_game (use last <= game date or <= gamePk)
+        if standing_prior is None:
+            try:
+                used_after_files: List[str] = []
+                if os.path.exists(explicit_after_each):
+                    used_after_files.append(explicit_after_each)
+                else:
+                    for name in os.listdir(standings_dir):
+                        if "standings_after_each_game" in name and name.endswith(".csv"):
+                            used_after_files.append(os.path.join(standings_dir, name))
+                fallback_candidate: Optional[Tuple[str, int, Optional[str]]] = None  # (rank, after_gamePk, date)
+                for path in used_after_files:
+                    rows = _load_csv_rows(path)
+                    if debug_standings:
+                        print({"debug":"standings","scan":"after_each","file": os.path.basename(path), "rows": len(rows)})
+                    for r in rows:
+                        lr = _lower_keys(r)
+                        tid = lr.get("team_id")
+                        try:
+                            tid = int(tid) if tid is not None else None
+                        except Exception:
+                            tid = None
+                        if tid != team_id:
+                            continue
+                        date_row = _parse_date_any(lr.get("date") or lr.get("game_date"))
+                        after_pk = lr.get("after_gamepk") or lr.get("after_game_pk")
+                        try:
+                            after_pk = int(after_pk) if after_pk is not None else None
+                        except Exception:
+                            after_pk = None
+                        rank_val = (
+                            lr.get("league_rank") or lr.get("league_rank_unique") or lr.get("rank")
+                            or lr.get("standing") or lr.get("standing_rank") or lr.get("rank_overall")
+                        )
+                        # choose: latest <= game date if we know date, else latest <= gamePk
+                        ok = False
+                        if gdate and date_row and date_row <= gdate:
+                            ok = True
+                        elif (not gdate) and (game_pk_local is not None) and (after_pk is not None) and (after_pk <= int(game_pk_local)):
+                            ok = True
+                        if ok and rank_val is not None:
+                            try:
+                                rank_int = int(rank_val)
+                            except Exception:
+                                rank_int = None
+                            if rank_int is None:
+                                continue
+                            # keep the best (latest) candidate by date or by after_pk
+                            if fallback_candidate is None:
+                                fallback_candidate = (str(rank_int), after_pk or 0, date_row)
+                            else:
+                                # prefer newer date; if tie/unknown, prefer larger after_pk
+                                old_rank, old_pk, old_date = fallback_candidate
+                                newer = False
+                                if gdate and date_row and old_date and date_row > old_date:
+                                    newer = True
+                                elif (not gdate) and (after_pk or 0) > (old_pk or 0):
+                                    newer = True
+                                if newer:
+                                    fallback_candidate = (str(rank_int), after_pk or 0, date_row)
+                if fallback_candidate is not None:
+                    try:
+                        standing_prior = int(fallback_candidate[0])
+                    except Exception:
+                        standing_prior = None
+                    if debug_standings:
+                        print({"debug":"standings","fallback":"after_each","standing_prior": standing_prior, "team_id": team_id})
+            except Exception:
+                pass
+
+        _standings_cache[cache_key] = (standing_prior, b2b, rest_days)
+        if debug_standings:
+            print({"debug":"standings","computed": True, "team_id": team_id, "game_date": gdate, "standing_prior": standing_prior, "b2b": b2b, "rest_days": rest_days})
+        return _standings_cache[cache_key]
+
+    # ---------- Per-team rows ----------
+    team_rows: List[Dict[str,Any]] = []
+    for w in windows:
+        for side in ("home", "away"):
+            opp = "away" if side == "home" else "home"
+            ids_start = w[f"{side}_ids_start"]
+            opp_start = w[f"{opp}_ids_start"]
+            ids_end   = w[f"{side}_ids_end"]
+            opp_end   = w[f"{opp}_ids_end"]
+            g_for  = int(w["goalies_start"][side])
+            g_opp  = int(w["goalies_start"][opp])
+
+            sk_for = len(ids_start)
+            sk_opp = len(opp_start)
+
+            # team-relative zone for this side
+            _zone_rel = zone_start_for(side, w["fo_zone"], w.get("fo_won_team_id"), home_team_id, away_team_id)
+            _ai_flag = int(after_icing_for_side(
+                w.get("start_prev_break_type"), w.get("start_prev_break_team_id"), side, home_team_id, away_team_id, w.get("fo_zone")
+            ))
+            _ai_by_team = int(_ai_flag == 1 and _zone_rel == "DZ")
+            _ai_by_opp  = int(_ai_flag == 1 and _zone_rel == "OZ")
+
+            row = {
+                "window_id": w["window_id"],
+                "period": w["period"],
+                "start_sec": w["start_sec"],
+                "end_sec": w["end_sec"],
+                "duration": w["duration"],
+                "clock_start": w["clock_start"],
+                "end_event_type": w["end_event_type"],
+                "strength_global": w["strength_global"],
+                "team_side": side,
+                "skaters_for": sk_for,
+                "skaters_against": sk_opp,
+                "goalie_for": g_for,
+                "goalie_against": g_opp,
+                "strength_team": strength_for_team(sk_for, sk_opp, g_for, g_opp),
+                "strength_team_label": (
+                    "powerplay" if strength_for_team(sk_for, sk_opp, g_for, g_opp) == "PP" else (
+                    "penalty_kill" if strength_for_team(sk_for, sk_opp, g_for, g_opp) == "PK" else (
+                    "even_strength" if strength_for_team(sk_for, sk_opp, g_for, g_opp) == "5v5" else (
+                    "four_on_four" if strength_for_team(sk_for, sk_opp, g_for, g_opp) == "4v4" else (
+                    "empty_net_for" if strength_for_team(sk_for, sk_opp, g_for, g_opp) == "EN_for" else strength_for_team(sk_for, sk_opp, g_for, g_opp)
+                ))))),
+                "fo_zone": _zone_rel,
+                "zone_start": _zone_rel,
+                "score_diff_start": score_diff_for_side(side, w["start_sec"]),
+                "clock_s": clock_s_at(w["start_sec"]),
+                "start_prev_break_type": w.get("start_prev_break_type"),
+                "start_prev_break_subtype": w.get("start_prev_break_subtype"),
+                "media_timeout_start": int(bool(w.get("media_timeout_start"))),
+                "after_icing": _ai_flag,
+                # Team-relative icing source flags via zone when after-icing
+                "after_icing_by_team": _ai_by_team,
+                "after_icing_by_opponent": _ai_by_opp,
+                "fo_won_team_id": w["fo_won_team_id"],
+                "home_away": (side == "home"),
+                "long_change": int(is_long_change(w["start_sec"])),
+                "team_ids_start": ids_start,
+                "opp_ids_start":  opp_start,
+                "team_ids_end":   ids_end,
+                "opp_ids_end":    opp_end,
+                "team_rows_marker": 1 if True else 1,
+            }
+            # fill standings/b2b best-effort once per side
+            tid = home_team_id if side=="home" else away_team_id
+            rank_prior, b2b_calc, rest_days_calc = compute_standings_and_b2b(tid)
+            if rank_prior is not None:
+                row["standing_prior"] = int(rank_prior)
+            if b2b_calc is not None:
+                row["b2b_team"] = int(bool(b2b_calc))
+            if rest_days_calc is not None:
+                row["rest_days_team"] = int(rest_days_calc)
+
+            # Faceoff flags at window start (team-relative)
+            won_tid = w.get("fo_won_team_id")
+            team_tid = home_team_id if side == "home" else away_team_id
+            # Gate 'seen' by being on-ice at the faceoff start (team had skaters on at start)
+            ids_start_set = set(row.get("team_ids_start", []) or [])
+            fo_seen_start = (won_tid is not None and len(ids_start_set) > 0)
+            fo_won_start  = (fo_seen_start and team_tid is not None and int(won_tid) == int(team_tid))
+            row.update({
+                "fo_seen_start": int(bool(fo_seen_start)),
+                "fo_won_start":  int(bool(fo_won_start)),
+                "fo_lost_start": int(bool(fo_seen_start) and not bool(fo_won_start)),
+            })
+
+            # Home last-change opportunity at window start (rule-based)
+            stoppage_types = {
+                'goal','penalty','icing','offside','stoppage',
+                'puck-out-of-play','goalie-stopped','timeout','challenge','period_start'
+            }
+            spbt = (w.get("start_prev_break_type") or "").lower()
+            is_home_side = (side == "home")
+            fo_expected = bool(fo_seen_start) or (spbt in stoppage_types)
+            excluded = spbt in {"strength","hard_cap","flow",""}
+            _hlc = bool(is_home_side and fo_expected and (not excluded))
+            if str(row.get("zone_start")).lower() == "flow":
+                _hlc = False
+            # If the home team committed the icing, they cannot change → force 0
+            try:
+                prev_tid = w.get("start_prev_break_team_id")
+                if spbt == "icing" and is_home_side and prev_tid is not None and home_team_id is not None and int(prev_tid) == int(home_team_id):
+                    _hlc = False
+            except Exception:
+                pass
+            row["home_last_change_opportunity"] = int(_hlc)
+
+            # pulled-goalie exposure at window start
+            gp_since = since_pulled_home[w["start_sec"]] if side == "home" else since_pulled_away[w["start_sec"]]
+            row.update({
+                "pulled_goalie_start": int(bool(g_for == 0)),
+                "goalie_pulled_since": int(gp_since),
+            })
+            team_rows.append(row)
+
+    # ---------- Per-player rows ----------
+    by_sec_home = {s: set(team_onice_by_sec[s][0]) for s in range(len(team_onice_by_sec))}
+    by_sec_away = {s: set(team_onice_by_sec[s][1]) for s in range(len(team_onice_by_sec))}
+
+    player_rows: List[Dict[str,Any]] = []
+
+    def _debug_log_ga(context: str, player_id: int, player_side: str, s_evt: int, win_id: str, start_sec: int, end_sec: int):
+        if not debug_ga:
+            return
+        cb = credit_by_sec.get(s_evt, {})
+        owner_tid = cb.get("owner_team_id")
+        owner_side = None
+        if owner_tid is not None and home_team_id is not None and away_team_id is not None:
+            try:
+                if int(owner_tid) == int(home_team_id): owner_side = "home"
+                elif int(owner_tid) == int(away_team_id): owner_side = "away"
+            except Exception:
+                owner_side = None
+        ev_types = sorted(list(types_by_sec.get(s_evt, set())))
+        pre_home = sorted(list(cb.get("onice_home", set()) or []))
+        pre_away = sorted(list(cb.get("onice_away", set()) or []))
+        name = (player_name_map.get(player_id) if isinstance(player_name_map, dict) else None)
+        print(
+            {
+                "debug": "GA_credit",
+                "context": context,
+                "game_second": s_evt,
+                "clock": clock_str(s_evt),
+                "window_id": win_id,
+                "window": [start_sec, end_sec],
+                "playerId": player_id,
+                "playerName": name,
+                "player_side": player_side,
+                "event_types_at_s": ev_types,
+                "owner_team_id": owner_tid,
+                "owner_side": owner_side,
+                "pre_onice_home": pre_home,
+                "pre_onice_away": pre_away,
+                "cb_home": dict(credit_by_sec.get(s_evt, {}).get("home", {})),
+                "cb_away": dict(credit_by_sec.get(s_evt, {}).get("away", {})),
+            }
+        )
+
+    # helper: TSF bucket shares by per-second time-since-last-faceoff
+    def tsf_bucket_shares(start_sec: int, end_sec: int) -> Dict[str,float]:
+        dur = max(0, end_sec - start_sec)
+        if dur == 0:
+            return {"tsf_0_5":0,"tsf_6_20":0,"tsf_21_60":0,"tsf_61p":0}
+        shares = {"tsf_0_5":0,"tsf_6_20":0,"tsf_21_60":0,"tsf_61p":0}
+        fo_seconds = sorted(fo_meta.keys())
+        k = 0
+        for s in range(start_sec, end_sec):
+            while k + 1 < len(fo_seconds) and fo_seconds[k+1] <= s:
+                k += 1
+            last_fo = fo_seconds[k] if fo_seconds and fo_seconds[0] <= s else None
+            tsf = (s - last_fo) if last_fo is not None else 10_000
+            if tsf <= 5: shares["tsf_0_5"] += 1
+            elif tsf <= 20: shares["tsf_6_20"] += 1
+            elif tsf <= 60: shares["tsf_21_60"] += 1
+            else: shares["tsf_61p"] += 1
+        for k in shares: shares[k] /= float(dur)
+        return shares
+
+    # --- NEW: shift metrics helpers ---
+    def onice_elapsed_before_second(p: int, sec: int, onice_map: Dict[int, set]) -> int:
+        """How long (in seconds) player p had been on before 'sec' (exclusive)."""
+        t = sec - 1
+        streak = 0
+        while t >= 0 and p in onice_map.get(t, ()):  # look back until off-ice
+            streak += 1
+            t -= 1
+        return streak
+
+    def last_shift_and_rest_before(p: int, sec: int, onice_map: Dict[int, set]) -> Tuple[int, int, int]:
+        """Return (last_shift_len_s, rest_gap_raw_s, prev_end_sec) before 'sec'.
+        If player is on at 'sec', we locate the previous completed shift and OFF gap before the
+        current shift. If no previous shift exists, last=0, rest_gap_raw=curr_start, prev_end=-1.
+        If player is off at 'sec', returns (0,0,-1).
+
+        Important: Treat period boundaries as hard breaks. The "current shift" cannot extend
+        backward into a prior period. This ensures intermission rest is handled as a gap
+        (e.g., 900s between regulation periods; 120s before OT)."""
+        if sec <= 0 or p not in onice_map.get(sec, ()):  # only for players on at this instant
+            return 0, 0, -1
+        curr_start = sec
+        sec_period = period_of(sec)
+        # Do not cross period boundary when walking back to find current shift start
+        while (
+            curr_start - 1 >= 0
+            and period_of(curr_start - 1) == sec_period
+            and p in onice_map.get(curr_start - 1, ())
+        ):
+            curr_start -= 1
+        t = curr_start - 1
+        while t >= 0 and p not in onice_map.get(t, ()):  # off gap
+            t -= 1
+        if t < 0:
+            return 0, curr_start, -1
+        prev_end = t
+        while t - 1 >= 0 and p in onice_map.get(t - 1, ()):  # previous on segment
+            t -= 1
+        prev_start = t
+        last_len = max(0, prev_end - prev_start + 1)
+        rest_len = max(0, curr_start - (prev_end + 1))
+        return int(last_len), int(rest_len), int(prev_end)
+
+    def shift_count_in_window(p: int, start_sec: int, end_sec: int, onice_map: Dict[int, set]) -> int:
+        """
+        Count contiguous on-ice segments that INTERSECT [start_sec, end_sec).
+        - If player is already on at start_sec, that counts as 1.
+        - Each off→on transition within the window adds 1.
+        """
+        if end_sec <= start_sec:
+            return 0
+
+        count = 0
+
+        # Does a segment already intersect at the window start?
+        on_at_start = (p in onice_map.get(start_sec, ()))
+        if on_at_start:
+            count += 1
+
+        # Count new entries after the start second
+        for s in range(start_sec + 1, end_sec):
+            now_on  = (p in onice_map.get(s, ()))
+            prev_on = (p in onice_map.get(s - 1, ()))
+            if now_on and not prev_on:
+                count += 1
+
+        return count
+
+    for w in windows:
+        start_s, end_s = w["start_sec"], w["end_sec"]
+        dur = max(0, end_s - start_s)
+        if dur == 0:
             continue
 
-        # micro events by actor at second s
-        for ev in events_by_sec.get(int(s), []):
-            et = str(ev.get("type") or "").lower()
-            if et not in MICRO_TYPES:
-                continue
-            det = ev.get("details") or {}
-            if et in ("giveaway", "takeaway"):
-                pid = _safe_int(det.get("playerId") or det.get("player_id") or det.get("actorPlayerId"), 0)
-                if pid == p:
-                    if et == "giveaway":
-                        gv_p += 1
-                        _bump_zone_counter(gv_zone, det)
-                        else:
-                        tk_p += 1
-                        _bump_zone_counter(tk_zone, det)
-            elif et == "hit":
-                pid = _safe_int(det.get("hittingPlayerId") or det.get("hitterPlayerId") or det.get("hitterId") or det.get("playerId"), 0)
-                if pid == p:
-                    hp_p += 1
-                    _bump_zone_counter(hp_zone, det)
-            elif et == "blocked-shot":
-                if str(det.get("reason", "")).lower() == "teammate-blocked":
-                                continue
-                blk_pid = _safe_int(det.get("blockingPlayerId") or det.get("blockedByPlayerId") or det.get("blockerPlayerId") or det.get("blockerId") or det.get("playerId"), 0)
-                if blk_pid == p:
-                    bp_p += 1
-                    _bump_zone_counter(bp_zone, det)
-                shot_pid = _safe_int(det.get("shootingPlayerId") or det.get("shooterId") or det.get("shooter"), 0)
-                if shot_pid == p:
-                    sbp_p += 1
-                    _bump_zone_counter(sbp_zone, det)
+        for side in ("home","away"):
+            opp = "away" if side == "home" else "home"
 
-        # shots/goals crediting (pre-change snapshots)
-        cb = credit_by_sec.get(int(s)) or {}
+            ids_start = set(w[f"{side}_ids_start"])
+            opp_start = set(w[f"{opp}_ids_start"])
+
+            onice_map = by_sec_home if side=="home" else by_sec_away
+            opp_map   = by_sec_away if side=="home" else by_sec_home
+
+            seen: Counter[int] = Counter()
+            for s in range(start_s, end_s):
+                for p in onice_map.get(s, ()): seen[p] += 1
+            if not seen:
+                continue
+
+            # outcomes: credit_by_sec is already directional
+            def event_for_against_for_second(s: int, player_side: str) -> Counter:
+                cb = credit_by_sec.get(s)
+                if not cb:
+                    return Counter()
+                return Counter(cb[player_side])
+
+            for p, sec_i in seen.items():
+                seconds_i = int(sec_i)
+                if seconds_i <= 0:
+                    continue
+
+                # ----- Edge-only tiny cameo drop with protective events -----
+                if DROP_PLAYER_EDGE_ROWS and seconds_i <= EDGE_CAMEO_SEC:
+                    first_p, last_p, protected = None, None, False
+                    for s in range(start_s, end_s):
+                        if p in onice_map.get(s, ()):
+                            if first_p is None: first_p = s
+                            last_p = s
+                            if protective_has_event(s, start_s, end_s):
+                                protected = True
+                    # NEW: Protect if player is in the credited goal freeze set at end_sec
+                    try:
+                        if str(w.get("end_event_type")) == "goal":
+                            # Build the freeze set used for goal credit (side-aware)
+                            # Reuse the same logic as in _maybe_correct_onice_for_goal but only to detect membership
+                            use_sec = end_s
+                            # If t-1 shift exists, scan back before it
+                            start_prev = end_s - 2 if (end_s - 1 >= 0 and shift_changes_by_sec.get(end_s - 1)) else end_s - 1
+                            freeze_home, freeze_away = set(), set()
+                            # Prefer most recent prior with stable 5v5; else use immediate prior
+                            chosen = None
+                            for back in range(0, 30):
+                                ss = start_prev - back if start_prev >= 0 else end_s - 1
+                                if ss < 0: break
+                                if ss < len(team_onice_by_sec):
+                                    hh, aa = team_onice_by_sec[ss]
+                                    freeze_home, freeze_away = set(hh), set(aa)
+                                    chosen = ss
+                                    if len(hh) >= 5 and len(aa) >= 5:
+                                        break
+                            freeze_set = freeze_home if side == "home" else freeze_away
+                            if p in freeze_set:
+                                protected = True
+                    except Exception:
+                        pass
+                    if first_p is not None:
+                        at_edge = (first_p == start_s) or (last_p == end_s - 1)
+                        # Force drop if a goal swap flagged this cameo at end edge
+                        try:
+                            if at_edge and last_p == end_s - 1 and p in forced_drop_cameo_by_sec_side.get((end_s, side), set()):
+                                continue
+                        except Exception:
+                            pass
+                        # New hard rule: if there was a shift-change at end_s-1 and window ends on a goal,
+                        # ignore that change entirely for this window — drop any player who arrived at end_s-1
+                        try:
+                            if at_edge and last_p == end_s - 1 and str(w.get("end_event_type")) == "goal":
+                                cameo_in = set((shift_changes_by_sec.get(end_s - 1) or {}).get(f"{side}_in", set()))
+                                if p in cameo_in:
+                                    continue
+                        except Exception:
+                            pass
+                        # New stricter rule: allow <=4s edge cameos ONLY if
+                        # (a) the cameo spans the entire window (small windows), or
+                        # (b) the window ends on a goal (reason == "goal"), or
+                        # (c) the end-second is a goalie-stopped after a SOG (SOG precedes goalie-stopped in sort order), or
+                        # (d) the final second has a defensive save before whistle/FO (block or takeaway before the boundary)
+                        small_window = (end_s - start_s) <= 10
+                        window_reason = str(w.get("end_event_type"))
+                        goalie_stop_protected = has_sog_before_goalie_stop(end_s)
+                        defense_save_protected = has_defense_save_before_whistle(end_s)
+                        end_is_goal = (window_reason == "goal")
+                        if not small_window and at_edge and not (end_is_goal or goalie_stop_protected or defense_save_protected):
+                            # if not protected by the stricter cases, drop the cameo row
+                            continue
+                        if at_edge and not protected:
+                            continue
+                # -----------------------------------------------------------
+
+                # exposures
+                pp_sec_i = 0
+                pk_sec_i = 0
+                team_strength = strength_for_team(
+                    skaters_for=len(w[f"{side}_ids_start"]),
+                    skaters_against=len(w[f"{opp}_ids_start"]),
+                    goalie_for=int(w["goalies_start"][side]),
+                    goalie_against=int(w["goalies_start"][opp]),
+                )
+                if team_strength == "PP": pp_sec_i = seconds_i
+                if team_strength == "PK": pk_sec_i = seconds_i
+
+                # outcomes: event-driven credit only while p is on pre-change on-ice for that event/second
+                Y = Counter(); xgF = 0.0; xgA = 0.0
+                for s in range(start_s, end_s):
+                    # boundary guard — include start-second events only if they occur AFTER the start boundary
+                    if s == start_s and second_has_credit_event(s):
+                        # Determine start boundary; prefer same_sec_order of faceoff when available, else sortOrder
+                        start_boundary_order = None
+                        start_face_sso = None
+                        evs_so = sorted(orders_by_sec.get(start_s, []))
+                        boundary_types = {"faceoff","stoppage","goal","goalie-stopped","penalty","timeout","challenge"}
+                        # faceoff same-sec order at start
+                        try:
+                            sso_list = [sso for sso, t in sorted(sso_by_sec.get(start_s, [])) if t == "faceoff"]
+                            if sso_list:
+                                start_face_sso = min(sso_list)
+                        except Exception:
+                            start_face_sso = None
+                        # boundary sortOrder fallback
+                        face_orders = [so for so, t in evs_so if t == "faceoff"]
+                        if face_orders:
+                            start_boundary_order = min(face_orders)
+                        else:
+                            boundary_orders = [so for so, t in evs_so if t in boundary_types]
+                            if boundary_orders:
+                                start_boundary_order = min(boundary_orders)
+                        # filter the events list in-place to keep only those with sortOrder > boundary
+                        filtered = []
+                        for ev in events_by_sec.get(s, []):
+                            et = ev.get("type")
+                            if not et: continue
+                            if (et not in SHOT_TYPES) and (et not in GOAL_TYPES):
+                                continue
+                            so = int(ev.get("sortOrder", 0))
+                            # Primary: same_sec_order vs faceoff at start; include only if sso > face_sso
+                            if start_face_sso is not None:
+                                try:
+                                    sso_ev = int(ev.get("same_sec_order", 0))
+                                except Exception:
+                                    sso_ev = None
+                                if sso_ev is None or sso_ev <= start_face_sso:
+                                    continue
+                            elif start_boundary_order is not None and so <= start_boundary_order:
+                                # Fallback to sortOrder if no same_sec_order boundary
+                                continue
+                            filtered.append(ev)
+                        # If nothing remains after filtering, skip this second
+                        if not filtered:
+                            continue
+                        # Use the filtered events for start-second boundary
+                        evs = filtered
+                    # If no start-second boundary filtering applied, fetch raw events
+                    if not (s == start_s and second_has_credit_event(s)):
+                        evs = events_by_sec.get(s, [])
+                    if not evs:
+                        continue
+
+                    cb = credit_by_sec.get(s) or {}
                     pre_home = list(cb.get("onice_home", ()))
                     pre_away = list(cb.get("onice_away", ()))
-        for ev in events_by_sec.get(int(s), []):
-            et = str(ev.get("type") or "").lower()
-            if et not in SHOT_TYPES and et not in GOAL_TYPES:
+
+                    for ev in evs:
+                        et = ev.get("type")
+                        if not et:
+                            continue
+                        if (et not in SHOT_TYPES) and (et not in GOAL_TYPES):
                             continue
                         det = ev.get("details") or {}
-            if et in BLOCK_TYPES and str(det.get("reason", "")).lower() == "teammate-blocked":
+                        ev_side = _owner_side_for_event(det, pre_home, pre_away)
+                        if ev_side not in ("home","away"):
                             continue
-            ev_side = _owner_side_for_event(det, game.home_team_id, game.away_team_id)
-            if ev_side not in ("home", "away"):
-                continue
-
-            # corrected on-ice for goals
-                        if et in GOAL_TYPES:
-                corr_home, corr_away = _maybe_correct_onice_for_goal(
-                    int(s), ev, set(pre_home), set(pre_away),
-                    game.home_team_id, game.away_team_id,
-                    team_onice_by_sec, orders_by_sec, shift_changes_by_sec,
-                )
+                        ev_opp = "away" if ev_side == "home" else "home"
+                        # If there was any shift-change at the prior second, freeze goal credit on the prior snapshot
+                        if et in GOAL_TYPES and (shift_changes_by_sec.get(s-1) or {}):
+                            # use on-ice of s-1 for crediting (freeze pre-change six)
+                            if s - 1 >= 0 and (s - 1) < len(team_onice_by_sec):
+                                prev_home_ids, prev_away_ids = team_onice_by_sec[s-1]
+                                pre_home2 = list(prev_home_ids)
+                                pre_away2 = list(prev_away_ids)
+                            else:
+                                pre_home2, pre_away2 = pre_home, pre_away
+                            corr_home, corr_away = _maybe_correct_onice_for_goal(s, ev, set(pre_home2), set(pre_away2))
+                            on_for = list(corr_home) if ev_side == "home" else list(corr_away)
+                            on_opp = list(corr_away) if ev_side == "home" else list(corr_home)
+                        elif et in GOAL_TYPES:
+                            corr_home, corr_away = _maybe_correct_onice_for_goal(s, ev, set(pre_home), set(pre_away))
                             on_for = list(corr_home) if ev_side == "home" else list(corr_away)
                             on_opp = list(corr_away) if ev_side == "home" else list(corr_home)
                         else:
                             on_for = pre_home if ev_side == "home" else pre_away
                             on_opp = pre_away if ev_side == "home" else pre_home
+                        xg = float(det.get("xg", 0.0)) if det.get("xg") is not None else 0.0
 
-            xg = float(det.get("xg", 0.0)) if det.get("xg") is not None else 0.0
+                        # Always AF/AA from owner/shooter perspective
                         if p in on_for:
                             Y["AF"] += 1
-                if et in SHOT_ON_GOAL_TYPES or et in GOAL_TYPES:
+                            if (et in SHOT_ON_GOAL_TYPES) or (et in GOAL_TYPES):
                                 Y["SF"] += 1
                                 xgF += xg
                         elif p in on_opp:
                             Y["AA"] += 1
-                if et in SHOT_ON_GOAL_TYPES or et in GOAL_TYPES:
+                            if (et in SHOT_ON_GOAL_TYPES) or (et in GOAL_TYPES):
                                 Y["SA"] += 1
                                 xgA += xg
-
+                        # For blocked shots, attribute BF/BA by blocker/defender side
                         if et in BLOCK_TYPES:
-                blk_pid = det.get("blockingPlayerId") or det.get("blockedByPlayerId") or det.get("blockerPlayerId") or det.get("blockerId")
+                            blk_det = det
+                            blk_pid = (
+                                blk_det.get("blockingPlayerId")
+                                or blk_det.get("blockedByPlayerId")
+                                or blk_det.get("blockerPlayerId")
+                                or blk_det.get("blockerId")
+                            )
+                            defender_side = None
                             try:
                                 blk_pid = int(blk_pid) if blk_pid is not None else None
                             except Exception:
                                 blk_pid = None
-                defender_side = None
                             if blk_pid is not None:
                                 if blk_pid in pre_home:
                                     defender_side = "home"
                                 elif blk_pid in pre_away:
                                     defender_side = "away"
                             if defender_side is None:
-                    defender_side = ("away" if ev_side == "home" else "home")
-                attacker_side = ("away" if defender_side == "home" else "home")
-                if defender_side == side and p in (pre_home if side == "home" else pre_away):
+                                defender_side = ev_opp  # fallback: defender is opposite of shooter
+                            attacker_side = "home" if defender_side == "away" else "away"
+                            if defender_side == "home" and p in pre_home:
                                 Y["BF"] += 1
-                if attacker_side == side and p in (pre_home if side == "home" else pre_away):
+                            if defender_side == "away" and p in pre_away:
+                                Y["BF"] += 1
+                            if attacker_side == "home" and p in pre_home:
                                 Y["BA"] += 1
-
+                            if attacker_side == "away" and p in pre_away:
+                                Y["BA"] += 1
                         if et in GOAL_TYPES:
+                            # GF/GA using the same corrected sets already used for AF/SF/xg
                             if p in on_for:
                                 Y["GF"] += 1
                             elif p in on_opp:
                                 Y["GA"] += 1
 
-        # co-presence (post evidence)
-        our = onice_map.get(int(s), ())
-        if p in our:
-            for q in our:
-                if q == p:
-                    continue
+                # Track corrected on-ice for a goal at end second (for teammate co-pres later)
+                end_goal_on_for_ids: set = set()
+
+                # include end-second credited events only if they occur BEFORE the end boundary (by sortOrder)
+                if second_has_credit_event(end_s):
+                    # Determine end boundary; prefer same_sec_order of faceoff when available, else sortOrder
+                    evs_end = sorted(orders_by_sec.get(end_s, []))
+                    boundary_types = {"faceoff","stoppage","goal","goalie-stopped","penalty","timeout","challenge"}
+                    end_face_sso = None
+                    try:
+                        face_sso_list = [sso for sso, t in sorted(sso_by_sec.get(end_s, [])) if t == "faceoff"]
+                        if face_sso_list:
+                            end_face_sso = min(face_sso_list)
+                    except Exception:
+                        end_face_sso = None
+                    face_orders_end = [so for so, t in evs_end if t == "faceoff"]
+                    if face_orders_end:
+                        end_boundary_order = min(face_orders_end)
+                    else:
+                        end_boundary_orders = [so for so, t in evs_end if t in boundary_types]
+                        end_boundary_order = min(end_boundary_orders) if end_boundary_orders else None
+                    # Use pre-change snapshot: if there was a shift at end_s-1, prefer end_s-2
+                    use_sec = end_s - 1
+                    if shift_changes_by_sec.get(end_s - 1):
+                        use_sec = max(0, end_s - 2)
+                    if 0 <= use_sec < len(team_onice_by_sec):
+                        home_ids, away_ids = team_onice_by_sec[use_sec]
+                        pre_home = list(home_ids)
+                        pre_away = list(away_ids)
+                    else:
+                        cb_end = credit_by_sec[end_s]
+                        pre_home = list(cb_end.get("onice_home", ()))
+                        pre_away = list(cb_end.get("onice_away", ()))
+                    for ev in events_by_sec.get(end_s, []):
+                        et = ev.get("type")
+                        if (et not in SHOT_TYPES) and (et not in GOAL_TYPES):
+                            continue
+                        # Include only events before the faceoff boundary at end: primary same_sec_order, fallback sortOrder
+                        try:
+                            so = int(ev.get("sortOrder", 0))
+                        except Exception:
+                            so = 0
+                        if end_face_sso is not None:
+                            try:
+                                sso_ev = int(ev.get("same_sec_order", 0))
+                            except Exception:
+                                sso_ev = None
+                            if sso_ev is None or sso_ev >= end_face_sso:
+                                continue
+                        elif end_boundary_order is not None and so >= end_boundary_order:
+                            continue
+                        det = ev.get("details") or {}
+                        ev_side = _owner_side_for_event(det, pre_home, pre_away)
+                        if ev_side not in ("home","away"):
+                            continue
+                        ev_opp = "away" if ev_side == "home" else "home"
+                        # Use corrected on-ice for goal events at end second; pre-change otherwise
+                        if et in GOAL_TYPES:
+                            corr_home, corr_away = _maybe_correct_onice_for_goal(end_s, ev, set(pre_home), set(pre_away))
+                            on_for = list(corr_home) if ev_side == "home" else list(corr_away)
+                            on_opp = list(corr_away) if ev_side == "home" else list(corr_home)
+                        else:
+                            on_for = pre_home if ev_side == "home" else pre_away
+                            on_opp = pre_away if ev_side == "home" else pre_home
+                        xg = float(det.get("xg", 0.0)) if det.get("xg") is not None else 0.0
+
+                        # AF/AA from shooter; BF/BA by blocker/defender side
+                        if p in on_for:
+                            Y["AF"] += 1
+                            if (et in SHOT_ON_GOAL_TYPES) or (et in GOAL_TYPES):
+                                Y["SF"] += 1
+                                xgF += xg
+                        elif p in on_opp:
+                            Y["AA"] += 1
+                            if (et in SHOT_ON_GOAL_TYPES) or (et in GOAL_TYPES):
+                                Y["SA"] += 1
+                                xgA += xg
+                        if et in BLOCK_TYPES:
+                            blk_det = det
+                            blk_pid = (
+                                blk_det.get("blockingPlayerId")
+                                or blk_det.get("blockedByPlayerId")
+                                or blk_det.get("blockerPlayerId")
+                                or blk_det.get("blockerId")
+                            )
+                            defender_side = None
+                            try:
+                                blk_pid = int(blk_pid) if blk_pid is not None else None
+                            except Exception:
+                                blk_pid = None
+                            if blk_pid is not None:
+                                if blk_pid in pre_home:
+                                    defender_side = "home"
+                                elif blk_pid in pre_away:
+                                    defender_side = "away"
+                            if defender_side is None:
+                                defender_side = ev_opp
+                            attacker_side = "home" if defender_side == "away" else "away"
+                            if defender_side == "home" and p in pre_home:
+                                Y["BF"] += 1
+                            if defender_side == "away" and p in pre_away:
+                                Y["BF"] += 1
+                            if attacker_side == "home" and p in pre_home:
+                                Y["BA"] += 1
+                            if attacker_side == "away" and p in pre_away:
+                                Y["BA"] += 1
+                        if et in GOAL_TYPES:
+                            # GF/GA consistent with the same corrected sets
+                            # also capture corrected team on-ice for teammate co-presence update later
+                            try:
+                                end_goal_on_for_ids = set(on_for)
+                            except Exception:
+                                end_goal_on_for_ids = set()
+                            if p in on_for:
+                                Y["GF"] += 1
+                            elif p in on_opp:
+                                Y["GA"] += 1
+
+                # GF/GA are now credited strictly event-driven above (per on-ice membership)
+
+                # chemistry copresence (adaptive, no event override)
+                overlap_with: Counter[int] = Counter()
+                overlap_vs:  Counter[int] = Counter()
+                event_copres_with: Dict[int, Counter] = defaultdict(Counter)
+
+                for s in range(start_s, end_s):
+                    on = onice_map.get(s, ())
+                    if p not in on: continue
+                    for q in on:
+                        if q == p: continue
                         overlap_with[q] += 1
-                if credit_by_sec.get(int(s)):
+                        if credit_by_sec.get(s):
                             event_copres_with[q]["any"] += 1
-                    for k in ("SF", "SA", "GF", "GA"):
-                        if (credit_by_sec[int(s)][side].get(k, 0) if int(s) in credit_by_sec else 0):
-                            event_copres_with[q][k] += int(credit_by_sec[int(s)][side][k])
-            for q in opp_map.get(int(s), ()):
-                overlap_vs[q] += 1
+                            for k in ("SF","SA","GF","GA"):
+                                if credit_by_sec[s][side].get(k,0):
+                                    event_copres_with[q][k] += int(credit_by_sec[s][side][k])
+                    for k in opp_map.get(s, ()):
+                        overlap_vs[k] += 1
 
-    # True on-ice exposure inside the token horizon (t_token, t_end] (already clipped to window end).
-    seconds_onice_in_h = sum(1 for s in range(int(start_target), int(end_target) + 1) if p in onice_map.get(int(s), ()))
-
-    def build_weighted_list(overlap: Counter[int], seconds_i: int, ev_map: Dict[int, Counter]) -> Tuple[List[int], List[float], List[int], List[float], Dict[int, Counter]]:
+                def build_weighted_list(
+                    overlap: Counter[int],
+                    seconds_i: int,
+                    event_copres_map: Dict[int, Counter],
+                ) -> Tuple[List[int], List[float], List[int], Dict[int,Counter], List[float]]:
+                    ids, ws, secs = [], [], []
                     if seconds_i <= 0:
-            return [], [], [], [], {}
+                        return ids, ws, secs, {}, []
                     if seconds_i < SHORT_WIN_SEC:
                         share_min = SHORT_SHARE_MIN
                         sec_floor_eff = max(2, int(SHORT_SEC_FRAC * seconds_i))
@@ -1448,1551 +2060,1112 @@ def aggregate_features_for_token(
                     kept: List[Tuple[int, int, float]] = []
                     for q, ov_sec in overlap.items():
                         raw_share = ov_sec / float(seconds_i)
-            if ov_sec >= sec_floor_eff and raw_share >= share_min:
+                        if (ov_sec >= sec_floor_eff) and (raw_share >= share_min):
                             kept.append((q, ov_sec, raw_share))
                     if not kept and seconds_i < SHORT_WIN_SEC and seconds_i >= 2 and TOPK_FALLBACK > 0 and overlap:
                         qbest, ovbest = max(overlap.items(), key=lambda kv: (kv[1], kv[0]))
                         if ovbest >= 2:
                             kept = [(qbest, ovbest, ovbest / float(seconds_i))]
-        ids: List[int] = []
-        secs: List[int] = []
-        shares: List[float] = []
-        w_raw: List[float] = []
+                    if not kept:
+                        return ids, ws, secs, {}, []
+                    raw_shares = []
+                    w_tmp = []
                     for q, ov_sec, raw_share in kept:
-            ids.append(int(q))
+                        ids.append(q)
                         secs.append(int(ov_sec))
-            shares.append(float(raw_share))
-            w_raw.append(raw_share)
-        ssum = sum(w_raw)
-        ws = [float(w / ssum) for w in w_raw] if ssum > 0 else [float(w) for w in w_raw]
-        ev_out = {q: ev_map.get(q, Counter()) for q, _, _ in kept}
-        return ids, ws, secs, shares, ev_out
+                        raw_shares.append(float(raw_share))
+                        w_tmp.append(raw_share)
+                    ssum = sum(w_tmp)
+                    ws = [w/ssum for w in w_tmp] if ssum > 0 else w_tmp
+                    return ids, ws, secs, {q: event_copres_map.get(q, Counter()) for q, *_ in kept}, raw_shares
 
-    ids_with, w_with, sec_with, share_with, ev_with = build_weighted_list(overlap_with, seconds_onice_in_h, event_copres_with)
-    ids_vs, w_vs, sec_vs, share_vs, _ = build_weighted_list(overlap_vs, seconds_onice_in_h, {})
+                ids_with, w_with, sec_with, ev_with, share_with = build_weighted_list(
+                    overlap_with, seconds_i, event_copres_with
+                )
+                # If a corrected end-second goal occurred for this side, bump with_event_GF for those corrected ids
+                if end_goal_on_for_ids:
+                    try:
+                        for q in ids_with:
+                            if q in end_goal_on_for_ids:
+                                ev_with.setdefault(q, Counter())
+                                ev_with[q]["GF"] = max(1, int(ev_with[q].get("GF", 0)))
+                    except Exception:
+                        pass
+                ids_vs,   w_vs,   sec_vs,   _,       share_vs   = build_weighted_list(
+                    overlap_vs, seconds_i, {}
+                )
 
-    return {
-        "seconds_onice_in_h": int(seconds_onice_in_h),
-        "xGF": float(xgF),
-        "xGA": float(xgA),
-        "GF": int(Y.get("GF", 0)),
-        "GA": int(Y.get("GA", 0)),
-        "SF": int(Y.get("SF", 0)),
-        "SA": int(Y.get("SA", 0)),
-        "AF": int(Y.get("AF", 0)),
-        "AA": int(Y.get("AA", 0)),
-        "BF": int(Y.get("BF", 0)),
-        "BA": int(Y.get("BA", 0)),
-        "giveaways_committed": int(gv_p),
-        "takeaways_forced": int(tk_p),
-        "hits_personal": int(hp_p),
-        "blocks_personal": int(bp_p),
-        "shots_blocked_personal": int(sbp_p),
-        "giveaways_committed_oz": int(gv_zone.get("OZ", 0)),
-        "giveaways_committed_nz": int(gv_zone.get("NZ", 0)),
-        "giveaways_committed_dz": int(gv_zone.get("DZ", 0)),
-        "takeaways_forced_oz": int(tk_zone.get("OZ", 0)),
-        "takeaways_forced_nz": int(tk_zone.get("NZ", 0)),
-        "takeaways_forced_dz": int(tk_zone.get("DZ", 0)),
-        "hits_personal_oz": int(hp_zone.get("OZ", 0)),
-        "hits_personal_nz": int(hp_zone.get("NZ", 0)),
-        "hits_personal_dz": int(hp_zone.get("DZ", 0)),
-        "blocks_personal_oz": int(bp_zone.get("OZ", 0)),
-        "blocks_personal_nz": int(bp_zone.get("NZ", 0)),
-        "blocks_personal_dz": int(bp_zone.get("DZ", 0)),
-        "shots_blocked_personal_oz": int(sbp_zone.get("OZ", 0)),
-        "shots_blocked_personal_nz": int(sbp_zone.get("NZ", 0)),
-        "shots_blocked_personal_dz": int(sbp_zone.get("DZ", 0)),
-        # POST-horizon overlap evidence (DO NOT use as PRE/CIN inputs)
-        "post_teammates_onice_ids_w": "|".join(str(x) for x in ids_with),
-        "post_teammates_onice_w": "|".join(str(x) for x in w_with),
-        "post_teammates_onice_sec_w": "|".join(str(x) for x in sec_with),
-        "post_teammates_onice_share_raw": "|".join(str(x) for x in share_with),
-        "post_opponents_onice_ids_w": "|".join(str(x) for x in ids_vs),
-        "post_opponents_onice_w": "|".join(str(x) for x in w_vs),
-        "post_opponents_onice_sec_w": "|".join(str(x) for x in sec_vs),
-        "post_opponents_onice_share_raw": "|".join(str(x) for x in share_vs),
-        "post_with_event_GF": "|".join(str(int(ev_with.get(q, {}).get("GF", 0))) for q in ids_with),
-        "post_with_event_GA": "|".join(str(int(ev_with.get(q, {}).get("GA", 0))) for q in ids_with),
-        "post_with_event_SF": "|".join(str(int(ev_with.get(q, {}).get("SF", 0))) for q in ids_with),
-        "post_with_event_SA": "|".join(str(int(ev_with.get(q, {}).get("SA", 0))) for q in ids_with),
-    }
+                # Weighted mean of opponent 5v5 usage percentile within their role
+                opp_pct_map = away_pct_role_5v5 if side == "home" else home_pct_role_5v5
+                if ids_vs and w_vs:
+                    mq, wsum = 0.0, 0.0
+                    for q, wq in zip(ids_vs, w_vs):
+                        mq += opp_pct_map.get(q, DEFAULT_PCT) * float(wq)
+                        wsum += float(wq)
+                    matchup_quality_pct = (mq / wsum) if wsum > 0 else None
+                else:
+                    matchup_quality_pct = None
 
+                # elapsed-in-window shares (over the player's own seconds)
+                elap = {"elapsed_share_0_5":0,"elapsed_share_6_20":0,"elapsed_share_21_60":0,"elapsed_share_61p":0}
+                if seconds_i > 0:
+                    for s in range(start_s, end_s):
+                        if p not in onice_map.get(s, ()): continue
+                        t = s - start_s
+                        if   t <= 5:  elap["elapsed_share_0_5"]  += 1
+                        elif t <= 20: elap["elapsed_share_6_20"] += 1
+                        elif t <= 60: elap["elapsed_share_21_60"]+= 1
+                        else:         elap["elapsed_share_61p"]  += 1
+                    for k in elap: elap[k] = elap[k] / seconds_i
 
-def generate_tokens_and_rows(
-    game: ParsedGame,
-    windows: List[Dict[str, Any]],
-    team_onice_by_sec: List[Tuple[List[int], List[int]]],
-    goalie_ids_by_sec: List[Dict[str, int]],
-    events_by_sec: Dict[int, List[Dict[str, Any]]],
-    orders_by_sec: Dict[int, List[Tuple[int, str]]],
-    sso_by_sec: Dict[int, List[Tuple[int, str]]],
-    shift_changes_by_sec: Dict[int, Dict[str, set]],
-    fo_meta: Dict[int, Dict[str, Any]],
-    end_event_at: Dict[int, Dict[str, Any]],
-    credit_by_sec: Dict[int, Dict[str, Any]],
-    cum_home_goals: List[int],
-    cum_away_goals: List[int],
-    horizon_sec: int,
-    min_swap: int,
-    min_gap_sec: int,
-    stable_sec: int,
-    rc_require_stable: int,
-    post_dwell_sec: int,
-    mass_swap_suppress_threshold: int,
-    max_tokens: int,
-    mode: str,
-    opp_change_tokens: int = 0,
-    opp_cover_gap_sec: int = 4,
-    player_name_map: Optional[Dict[int, str]] = None,
-    player_pos_map: Optional[Dict[int, str]] = None,
-    season: str = "",
-    date: str = "",
-    rinkid: Any = None,
-    # Deprecated legacy knobs (ROSTER_CHANGE tokenization). Kept for call-site compatibility.
-    matchup_stable_sec: int = 6,
-    # --- STATE tokenization controls (outcome supervision) ---
-    # --- STATE tokenization controls (outcome supervision) ---
-    min_exposure_sec: int = 5,
-    state_stable_sec: int = 2,
-    state_chunk_by_h: int = 0,
-) -> List[Dict[str, Any]]:
-    """
-    Build token rows for each (window, player) using:
-    - ENTRY / WINDOW_START / EXIT tokens for selection/termination (coach process) supervision
-    - STATE tokens for outcome supervision
+                tsf = tsf_bucket_shares(start_s, end_s)
 
-    STATE tokens correspond to (mostly) piecewise-constant matchup states:
-      state(s) = (teammate_set_excl_player, opponent_set, own_goalie_id, opp_goalie_id, strength_global)
+                # --- NEW: shift metrics for this player ---
+                elapsed_at_start = onice_elapsed_before_second(p, start_s, onice_map)
+                shifts_in_win    = shift_count_in_window(p, start_s, end_s, onice_map)
 
-    For STATE tokens, the effective target interval ends at the end of the current matchup-state run:
-      Because targets are counted in (t_token, t_end] (inclusive of t_end), we cap at run_end (not run_end+1)
-      so we do not include the first second of the next state.
-      t_end = min(t_token + H, run_end, win_end_sec, seg_last_on)
+                # Anchor at player's first ON second in the window (or start_sec if already on)
+                anchor_s = start_s if p in onice_map.get(start_s, ()) else None
+                if anchor_s is None:
+                    for s_ in range(start_s, end_s):
+                        if p in onice_map.get(s_, ()):  # first on in window
+                            anchor_s = s_
+                            break
+                # Determine last ON second within the window
+                last_on_s = end_s - 1
+                while last_on_s >= start_s and p not in onice_map.get(last_on_s, ()):  # walk back
+                    last_on_s -= 1
+                # Entry/exit context relative to window bounds
+                entry_offset_s = int(anchor_s - start_s) if anchor_s is not None else 0
+                entered_after_start = 1 if (anchor_s is not None and entry_offset_s > 0) else 0
+                exit_offset_s = int((end_s - 1) - last_on_s) if last_on_s >= start_s else 0
+                exited_before_end = 1 if (last_on_s >= start_s and exit_offset_s > 0) else 0
+                # Compute previous shift history relative to anchor_s
+                last_len_s = float('nan')
+                time_since_last_shift_s = float('nan')
+                last_shift_missing = 1
+                if anchor_s is not None:
+                    last_len_raw, rest_gap_raw_s, prev_end_sec = last_shift_and_rest_before(p, anchor_s, onice_map)
+                    if prev_end_sec < 0:
+                        # First appearance this game: leave NaNs and masks = 1
+                        last_shift_missing = 1
+                        last_len_s = float('nan')
+                        time_since_last_shift_s = float('nan')
+                    else:
+                        last_shift_missing = 0
+                        last_len_s = float(int(last_len_raw))
+                        prev_period = period_of(prev_end_sec)
+                        curr_period = period_of(anchor_s)
+                        intermission_added_s = 0
+                        if curr_period > prev_period:
+                            intermission_added_s = 120 if curr_period == 4 else 900
+                        # TV-timeout bonus applies only within the same period; do not add across intermission
+                        tv_timeout_added_s = 0
+                        if curr_period == prev_period:
+                            try:
+                                for ss in range(prev_end_sec + 1, anchor_s + 1):
+                                    if ss in tv_timeout_secs:
+                                        tv_timeout_added_s = 90
+                                        break
+                            except Exception:
+                                tv_timeout_added_s = 0
+                        time_since_last_shift_s = float(int(rest_gap_raw_s + intermission_added_s + tv_timeout_added_s))
 
-    This guarantees that outcome supervision tokens do NOT mix different matchup states inside their horizon.
-    Outcomes are computed over (t_token, t_end] and only while player is on-ice, using pre-change
-    on-ice snapshots for each second.
-    """
-    player_name_map = player_name_map or {}
-    player_pos_map = player_pos_map or {}
+                # Stint runs inside the window: contiguous ON segments lengths
+                stint_lengths: List[int] = []
+                _run = 0
+                for s_ in range(start_s, end_s):
+                    if p in onice_map.get(s_, ()):  # on
+                        _run += 1
+                    else:
+                        if _run > 0:
+                            stint_lengths.append(_run)
+                            _run = 0
+                if _run > 0:
+                    stint_lengths.append(_run)
+                if stint_lengths:
+                    stint_duration_max = int(max(stint_lengths))
+                    if len(stint_lengths) == 1:
+                        stint_duration_std = 0.0
+                    else:
+                        _n = len(stint_lengths)
+                        _mean = sum(stint_lengths) / _n
+                        _var = sum((x - _mean) * (x - _mean) for x in stint_lengths) / _n
+                        stint_duration_std = float(math.sqrt(_var))
+                else:
+                    stint_duration_max = 0
+                    stint_duration_std = 0.0
 
-    by_sec_home = {s: set(team_onice_by_sec[s][0]) for s in range(len(team_onice_by_sec))}
-    by_sec_away = {s: set(team_onice_by_sec[s][1]) for s in range(len(team_onice_by_sec))}
+                # compute after-icing flag for player rows (team-relative)
+                ai_flag_player = after_icing_for_side(
+                    w.get("start_prev_break_type"),
+                    w.get("start_prev_break_team_id"),
+                    side, home_team_id, away_team_id, w.get("fo_zone")
+                )
 
-    # Precompute per-player completed shift length stats (used for fatigue proxy).
-    horizon_local = len(team_onice_by_sec) - 2
-    shift_stats_home = build_shift_length_stats(by_sec_home, horizon_local)
-    shift_stats_away = build_shift_length_stats(by_sec_away, horizon_local)
+                # faceoff winner flag at window start for this player
+                fo_seen_start_flag = (w.get("fo_won_player_id") is not None)
+                try:
+                    is_faceoff_winner_start = bool(fo_seen_start_flag and w.get("fo_won_player_id") is not None and int(w.get("fo_won_player_id")) == int(p))
+                except Exception:
+                    is_faceoff_winner_start = False
+                try:
+                    is_faceoff_loser_start = bool(fo_seen_start_flag and w.get("fo_lost_player_id") is not None and int(w.get("fo_lost_player_id")) == int(p))
+                except Exception:
+                    is_faceoff_loser_start = False
 
-    # "Seen roster" per side (skaters only) for cheap bench availability features
-    home_seen: set = set()
-    away_seen: set = set()
-    for hh, aa in team_onice_by_sec:
-        home_seen.update(int(x) for x in hh)
-        away_seen.update(int(x) for x in aa)
-
-    def score_at_start(start_sec: int) -> Tuple[int, int]:
-        # goals BEFORE this second
-        return cum_home_goals[start_sec], cum_away_goals[start_sec]
-
-    def score_diff_for_side(side: str, start_sec: int) -> int:
-        h, a = score_at_start(start_sec)
-        return (h - a) if side == "home" else (a - h)
-
-    def score_bucket(diff: int) -> str:
-        if diff <= -2:
-            return "trail_2p"
-        if diff == -1:
-            return "trail_1"
-        if diff == 0:
-            return "tied"
-        if diff == 1:
-            return "lead_1"
-        return "lead_2p"
-
-    def _tok_prio(tok_type: str) -> int:
-        return int(TOKEN_PRIORITIES.get(str(tok_type).upper(), 999))
-
-    def onice_elapsed_before_second(p: int, sec: int, onice_map: Dict[int, set]) -> int:
-        t = sec - 1
-        streak = 0
-        while t >= 0 and p in onice_map.get(t, ()):
-            streak += 1
-            t -= 1
-        return streak
-
-    def last_shift_and_rest_before(p: int, sec: int, onice_map: Dict[int, set]) -> Tuple[int, int]:
-        if sec <= 0 or p not in onice_map.get(sec, ()):
-            return 0, 0
-        curr_start = sec
-        sec_period = period_of(sec)
-        while curr_start - 1 >= 0 and period_of(curr_start - 1) == sec_period and p in onice_map.get(curr_start - 1, ()):
-            curr_start -= 1
-        t = curr_start - 1
-        while t >= 0 and p not in onice_map.get(t, ()):
-            t -= 1
-        if t < 0:
-            return 0, curr_start
-        prev_end = t
-        while t - 1 >= 0 and p in onice_map.get(t - 1, ()):
-            t -= 1
-        prev_start = t
-        last_len = max(0, prev_end - prev_start + 1)
-        rest_len = max(0, curr_start - (prev_end + 1))
-        return int(last_len), int(rest_len)
-
-    def _onice_sets_at(sec: int, side: str) -> Tuple[set, set]:
-        ss = max(0, min(sec, len(team_onice_by_sec) - 1))
-        h, a = team_onice_by_sec[ss]
-        return (set(h), set(a)) if side == "home" else (set(a), set(h))
-
-    def _goalie_ids_at(sec: int, side: str) -> Tuple[int, int]:
-        ss = max(0, min(sec, len(goalie_ids_by_sec) - 1))
-        g = goalie_ids_by_sec[ss]
-        return (_safe_int(g.get("home", 0)), _safe_int(g.get("away", 0))) if side == "home" else (_safe_int(g.get("away", 0)), _safe_int(g.get("home", 0)))
-
-    def _strength_team_at(sec: int, side: str) -> str:
-        our, opp = _onice_sets_at(sec, side)
-        og, tg = _goalie_ids_at(sec, side)
-        return strength_for_team(len(our), len(opp), int(og != 0), int(tg != 0))
-
-    # Per-second strength_global for STATE tokenization (must match container encoding).
-    horizon_local_s = len(team_onice_by_sec) - 2
-    strength_global_by_sec: List[str] = []
-    for s in range(horizon_local_s + 1):
-        h_ids, a_ids = team_onice_by_sec[max(0, min(s, horizon_local_s))]
-        gh = _safe_int(goalie_ids_by_sec[max(0, min(s, len(goalie_ids_by_sec) - 1))].get("home", 0))
-        ga = _safe_int(goalie_ids_by_sec[max(0, min(s, len(goalie_ids_by_sec) - 1))].get("away", 0))
-        gh_present = 1 if gh != 0 else 0
-        ga_present = 1 if ga != 0 else 0
-        strength_global_by_sec.append(f"{len(h_ids)}v{len(a_ids)}_GH{gh_present}_GA{ga_present}")
-
-    rows: List[Dict[str, Any]] = []
-    m = str(mode or "both").lower().strip()
-
-    # Token-local faceoff zone at/before each second (rink zone code)
-    last_fo_zone_by_sec: Dict[int, str] = {}
-    last_z = "flow"
-    max_s = len(team_onice_by_sec) - 2
-    for s in range(max_s + 1):
-        if s in fo_meta:
-            last_z = str((fo_meta.get(s) or {}).get("zone") or last_z)
-        last_fo_zone_by_sec[s] = last_z
-
-    stoppage_types_for_last_change = {
-        "goal", "penalty", "icing", "offside", "stoppage", "puck-out-of-play",
-        "goalie-stopped", "timeout", "challenge", "period_start", "faceoff",
-    }
-
-    stoppage_types_for_exit_reason = {
-        "goal", "penalty", "icing", "offside", "stoppage", "puck-out-of-play",
-        "goalie-stopped", "timeout", "challenge", "faceoff",
-    }
-
-    def _exit_reason_proxy(side: str, t_exit: int) -> str:
-        """
-        Best-effort proxy for why a shift ended at t_exit.
-        Uses only info at/around the exit second; meant for causal supervision, not perfect labeling.
-        """
-        # Goal for/against at prior second is highly informative
-        try:
-            cb_prev = credit_by_sec.get(max(0, t_exit - 1)) or {}
-            if int((cb_prev.get(side) or {}).get("GA", 0)) > 0:
-                return "goal_against"
-            if int((cb_prev.get(side) or {}).get("GF", 0)) > 0:
-                return "goal_for"
+                # Home last-change opportunity (team-side property, stamped on player rows for convenience)
+                stoppage_types = {
+                    'goal','penalty','icing','offside','stoppage',
+                    'puck-out-of-play','goalie-stopped','timeout','challenge','period_start'
+                }
+                spbt_p = (w.get("start_prev_break_type") or "").lower()
+                fo_seen_start_team = (w.get("fo_won_team_id") is not None)
+                is_home_side_player = (side == "home")
+                fo_expected_player = bool(fo_seen_start_team) or (spbt_p in stoppage_types)
+                excluded_player = spbt_p in {"strength","hard_cap","flow",""}
+                home_last_change_opportunity_flag = bool(is_home_side_player and fo_expected_player and (not excluded_player))
+                if str(zone_start_for(side, w["fo_zone"], w.get("fo_won_team_id"), home_team_id, away_team_id)).lower() == "flow":
+                    home_last_change_opportunity_flag = False
+                # Home iced → no change allowed
+                try:
+                    prev_tid_p = w.get("start_prev_break_team_id")
+                    if spbt_p == "icing" and is_home_side_player and prev_tid_p is not None and home_team_id is not None and int(prev_tid_p) == int(home_team_id):
+                        home_last_change_opportunity_flag = False
                 except Exception:
                     pass
 
-        ev = end_event_at.get(t_exit)
-        if isinstance(ev, dict):
-            et = str(ev.get("type") or "").lower()
-            if et in stoppage_types_for_exit_reason:
-                # icing special case
-                if et in {"stoppage", "goalie-stopped"}:
-                    det = ev.get("details") or {}
-                    sub_reason = str(det.get("reason") or det.get("stoppageReason") or "").lower()
-                    if sub_reason == "icing":
-                        return "icing"
-                return et
+                # player-side zone and after-icing flags
+                _zone_rel_p = zone_start_for(side, w["fo_zone"], w.get("fo_won_team_id"), home_team_id, away_team_id)
+                _ai_flag_player_int = int(ai_flag_player)
+                _ai_by_team_p = int(_ai_flag_player_int == 1 and _zone_rel_p == "DZ")
+                _ai_by_opp_p  = int(_ai_flag_player_int == 1 and _zone_rel_p == "OZ")
 
-        # strength regime change at exit second
-        try:
-            st0 = _strength_team_at(max(0, t_exit - 1), side)
-            st1 = _strength_team_at(t_exit, side)
-            if st0 != st1:
-                return "strength_change"
-        except Exception:
-            pass
+                # Safe position mapping (boxscore may be missing in some games)
+                _pos_code = (player_pos_map.get(p) if isinstance(player_pos_map, dict) else None)
+                _pos_upper = str(_pos_code).upper() if _pos_code is not None else ""
+                _pos_simple = ("F" if _pos_upper in {"C","L","R"} else ("D" if _pos_upper == "D" else None))
 
-        return "line_change"
+                row = {
+                    "window_id": w["window_id"],
+                    "team_side": side,
+                    "period": w["period"],
+                    "start_sec": start_s,
+                    "end_sec": end_s,
+                    "duration": dur,
+                    "clock_start": w["clock_start"],
+                    "end_event_type": w["end_event_type"],
+                    "strength_global": ("PP" if w["strength_global"] == "PP_home" and side == "home" else (
+                                           "PP" if w["strength_global"] == "PP_away" and side == "away" else (
+                                           "PK" if w["strength_global"] == "PP_home" and side == "away" else (
+                                           "PK" if w["strength_global"] == "PP_away" and side == "home" else w["strength_global"])))),
+                    "fo_zone": _zone_rel_p,
+                    "zone_start": _zone_rel_p,
+                    "start_prev_break_type": w.get("start_prev_break_type"),
+                    "start_prev_break_subtype": w.get("start_prev_break_subtype"),
+                    "media_timeout_start": int(bool(w.get("media_timeout_start"))),
+                    "delayed_penalty": int(bool(w.get("delayed_penalty"))),
+                    "after_icing": _ai_flag_player_int,
+                    # Team-relative icing source flags via zone when after-icing
+                    "after_icing_by_team": _ai_by_team_p,
+                    "after_icing_by_opponent": _ai_by_opp_p,
+                    "is_faceoff_winner_start": is_faceoff_winner_start,
+                    "is_faceoff_loser_start": is_faceoff_loser_start,
+                    "home_away": (side == "home"),
+                    "long_change": int(is_long_change(start_s)),
+                    "home_last_change_opportunity": int(home_last_change_opportunity_flag),
+                    # Faceoff taker markers at window start (player-centric)
+                    "fo_took_start": int(1 if (fo_seen_start and p == (w.get("fo_center_start_id") or -1)) else 0),
+                    "fo_won_taken_start": (1 if (fo_seen_start and p == (w.get("fo_center_start_id") or -1) and w.get("fo_won_start")) else (0 if (fo_seen_start and p == (w.get("fo_center_start_id") or -1) and w.get("fo_lost_start")) else None)),
+                    "fo_lost_taken_start": (1 if (fo_seen_start and p == (w.get("fo_center_start_id") or -1) and w.get("fo_lost_start")) else (0 if (fo_seen_start and p == (w.get("fo_center_start_id") or -1) and w.get("fo_won_start")) else None)),
+                    "playerId": p,
+                    "positionCode": _pos_code,
+                    "position": _pos_simple,
+                    "playerName": (player_name_map.get(p) if isinstance(player_name_map, dict) else None),
+                    # exposures
+                    "seconds": seconds_i,
+                    "pp_seconds": pp_sec_i,
+                    "pk_seconds": pk_sec_i,
+                    # new: roster context at window start
+                    "us_skaters_start": int(len(w[f"{side}_ids_start"])),
+                    "them_skaters_start": int(len(w[f"{opp}_ids_start"])),
+                    "opponent_goalie_id_start": int((w.get("goalie_ids_start", {}) or {}).get(opp, 0) or 0),
+                    # optional shares for treatments/controls
+                    "pp_share": (pp_sec_i / seconds_i) if seconds_i > 0 else 0.0,
+                    "pk_share": (pk_sec_i / seconds_i) if seconds_i > 0 else 0.0,
+                    "offset_log_toi": math.log(max(1, seconds_i)),
+                    "offset_log_pp":  math.log(max(1, pp_sec_i)),
+                    "offset_log_pk":  math.log(max(1, pk_sec_i)),
+                    # NEW: shift metrics
+                    "onice_elapsed_at_window_start": elapsed_at_start,
+                    "shift_count_in_window": shifts_in_win,
+                    "last_shift_len_s": (int(last_len_s) if not math.isnan(last_len_s) else float('nan')),
+                    "time_since_last_shift_s": (int(time_since_last_shift_s) if not math.isnan(time_since_last_shift_s) else float('nan')),
+                    "last_shift_len_missing": int(1 if math.isnan(last_len_s) else 0),
+                    "time_since_last_shift_missing": int(1 if math.isnan(time_since_last_shift_s) else 0),
+                    "entered_after_start": int(entered_after_start),
+                    "entry_offset_s": int(entry_offset_s),
+                    "exited_before_end": int(exited_before_end),
+                    "exit_offset_s": int(exit_offset_s),
+                    "stint_duration_max": int(stint_duration_max),
+                    "stint_duration_std": float(stint_duration_std),
+                    "stint_duration_st": float(stint_duration_std),
+                    # TRAIN–X controls
+                    "score_diff_start": score_diff_for_side(side, start_s),
+                    "score_state_start": _score_state_bucket(score_diff_for_side(side, start_s)),
+                    "clock_s": clock_s_at(start_s),
+                    "matchup_quality_pct": (float(matchup_quality_pct) if matchup_quality_pct is not None else None),
+                    # outcomes
+                    "xGF": float(xgF), "xGA": float(xgA),
+                    "GF": int(Y["GF"]), "GA": int(Y["GA"]),
+                    "SF": int(Y["SF"]), "SA": int(Y["SA"]),
+                    "AF": int(Y["AF"]), "AA": int(Y["AA"]),
+                    "BF": int(Y["BF"]), "BA": int(Y["BA"]),
+                    # TSF + elapsed
+                    **tsf,
+                    **elap,
+                    # chemistry rep
+                    "teammates_onice_ids_start": sorted(list(ids_start)),
+                    "opponents_onice_ids_start": sorted(list(opp_start)),
 
-    def _bench_rest_bucket(rest_s: int) -> str:
-        if rest_s <= 10:
-            return "rest_0_10"
-        if rest_s <= 30:
-            return "rest_11_30"
-        if rest_s <= 60:
-            return "rest_31_60"
-        return "rest_61p"
+                    "teammates_onice_ids_w": ids_with,
+                    "teammates_onice_w": [float(x) for x in w_with],
+                    "teammates_onice_sec_w": [int(x) for x in sec_with],
+                    "teammates_onice_share_raw": [float(x) for x in share_with],
 
-    for w in windows:
-        win_id = w["window_id"]
-        start_s, end_s = int(w["start_sec"]), int(w["end_sec"])
-        if end_s <= start_s:
-            continue
+                    "opponents_onice_ids_w": ids_vs,
+                    "opponents_onice_w": [float(x) for x in w_vs],
+                    "opponents_onice_sec_w": [int(x) for x in sec_vs],
+                    "opponents_onice_share_raw": [float(x) for x in share_vs],
 
-        for side in ("home", "away"):
-            onice_map = by_sec_home if side == "home" else by_sec_away
-            team_id = game.home_team_id if side == "home" else game.away_team_id
-
-            seen: Counter[int] = Counter()
-            secs_on_by_player: Dict[int, List[int]] = defaultdict(list)
+                    # event co-presence (aligned to teammates list)
+                    "with_event_GF": [int(ev_with.get(q,{}).get("GF",0)) for q in ids_with],
+                    "with_event_GA": [int(ev_with.get(q,{}).get("GA",0)) for q in ids_with],
+                    "with_event_SF": [int(ev_with.get(q,{}).get("SF",0)) for q in ids_with],
+                    "with_event_SA": [int(ev_with.get(q,{}).get("SA",0)) for q in ids_with],
+                    # flags
+                    "goalie_pulled_since": 0,
+                }
+                # Personal puck-management: giveaways committed and takeaways forced within the window
+                gv_p, tk_p = 0, 0
+                hp_p, bp_p = 0, 0
                 for s in range(start_s, end_s):
-                for p in onice_map.get(s, ()):
-                    pid = int(p)
-                    seen[pid] += 1
-                    secs_on_by_player[pid].append(int(s))
-            if not seen:
-                continue
+                    for ev in events_by_sec.get(s, []):
+                        et = str(ev.get("type", "")).lower()
+                        det = ev.get("details") or {}
 
-            for p, sec_i in seen.items():
-                if int(sec_i) <= 0:
-                    continue
-                secs_on = secs_on_by_player.get(int(p), [])
-                if not secs_on:
-                    continue
-
-                secs_on_sorted = sorted(secs_on)
-                segments: List[Tuple[int, int]] = []
-                seg_start = secs_on_sorted[0]
-                prev_s = secs_on_sorted[0]
-                for s in secs_on_sorted[1:]:
-                    if s == prev_s + 1:
-                        prev_s = s
-                        continue
-                    segments.append((int(seg_start), int(prev_s)))
-                    seg_start = s
-                    prev_s = s
-                segments.append((int(seg_start), int(prev_s)))
-
-                # Build candidate tokens across all segments, then assign deterministic token_idx per player per window.
-                token_specs: List[Dict[str, Any]] = []
-                for seg_idx, (seg_s, seg_last_on) in enumerate(segments):
-                    t_entry = int(seg_s)
-                    t_exit = int(seg_last_on + 1)  # first second off after being on (may equal end_s)
-
-                    # Compute the player's true segment start in game time (may be before this container).
-                    seg_true_start = int(seg_s)
-                    tt = int(seg_s) - 1
-                    while tt >= 0 and p in onice_map.get(tt, ()):
-                        seg_true_start = int(tt)
-                        tt -= 1
-
-                    # ENTRY: only if the player actually entered within this window
-                    if int(seg_true_start) == int(seg_s):
-                        token_specs.append({"t": t_entry, "type": "ENTRY", "seg_idx": seg_idx, "seg_s": int(seg_s), "seg_true_start": int(seg_true_start), "seg_last_on": int(seg_last_on), "t_exit": int(t_exit)})
-
-                    # WINDOW_START: only if player is on at window start AND was already on before the window started.
-                    # This avoids emitting both WINDOW_START and ENTRY at the same second.
-                    if p in onice_map.get(int(start_s), ()) and int(start_s) > 0 and (p in onice_map.get(int(start_s) - 1, ())):
-                        token_specs.append({"t": int(start_s), "type": "WINDOW_START", "seg_idx": seg_idx, "seg_s": int(seg_s), "seg_true_start": int(seg_true_start), "seg_last_on": int(seg_last_on), "t_exit": int(t_exit)})
-                    if int(start_s) <= int(t_exit) <= int(end_s):
-                        token_specs.append({"t": int(t_exit), "type": "EXIT", "seg_idx": seg_idx, "seg_s": int(seg_s), "seg_true_start": int(seg_true_start), "seg_last_on": int(seg_last_on), "t_exit": int(t_exit)})
-
-                    # -------------------- STATE tokens (outcome supervision) --------------------
-                    # Build matchup "state runs" inside this player's on-ice segment, then emit STATE tokens
-                    # at run starts (and every H seconds for long runs).
-
-                    def _state_key(sec: int) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int, str]:
-                        our, opp = _onice_sets_at(int(sec), side)
-                        tm = tuple(sorted(int(x) for x in (our - {int(p)})))
-                        op = tuple(sorted(int(x) for x in opp))
-                        og, tg = _goalie_ids_at(int(sec), side)
-                        sg = strength_global_by_sec[max(0, min(int(sec), len(strength_global_by_sec) - 1))]
-                        return tm, op, int(og), int(tg), str(sg)
-
-                    def _state_change_reason(k0: Tuple, k1: Tuple) -> str:
-                        tm0, op0, og0, tg0, sg0 = k0
-                        tm1, op1, og1, tg1, sg1 = k1
-                        parts: List[str] = []
-                        if tm0 != tm1:
-                            parts.append("team")
-                        if op0 != op1:
-                            parts.append("opp")
-                        if int(og0) != int(og1):
-                            parts.append("own_goalie")
-                        if int(tg0) != int(tg1):
-                            parts.append("opp_goalie")
-                        if str(sg0) != str(sg1):
-                            parts.append("strength")
-                        return "+".join(parts) if parts else "none"
-
-                    # 1) Raw maximal runs of constant state_key (optionally debounced by state_stable_sec).
-                    runs: List[Dict[str, Any]] = []
-                    if int(seg_s) <= int(seg_last_on):
-                        s2 = int(seg_s)
-                        cur_k = _state_key(int(s2))
-                        run_start = int(s2)
-                        s2 += 1
-                        while s2 <= int(seg_last_on):
-                            k = _state_key(int(s2))
-                            if k == cur_k:
-                                s2 += 1
-                                continue
-                            if int(state_stable_sec) > 1:
-                                ok = True
-                                for t3 in range(int(s2), min(int(seg_last_on), int(s2) + int(state_stable_sec) - 1) + 1):
-                                    if _state_key(int(t3)) != k:
-                                        ok = False
-                                break
-                                if not ok:
-                                    s2 += 1
-                                    continue
-                            runs.append({"start": int(run_start), "end": int(s2 - 1), "key": cur_k})
-                            cur_k = k
-                            run_start = int(s2)
-                            s2 += 1
-                        runs.append({"start": int(run_start), "end": int(seg_last_on), "key": cur_k})
-
-                    def _dur(rr: Dict[str, Any]) -> int:
-                        return int(rr["end"]) - int(rr["start"]) + 1
-
-                    # 2) Merge micro-runs (< min_exposure_sec), prefer forward merge into the next run if it exists.
-                    changed = True
-                    while changed and len(runs) >= 2:
-                        changed = False
-                        # merge adjacent identical keys (defensive)
-                        merged: List[Dict[str, Any]] = []
-                        for rr in runs:
-                            if merged and merged[-1]["key"] == rr["key"] and int(rr["start"]) <= int(merged[-1]["end"]) + 1:
-                                merged[-1]["end"] = int(rr["end"])
-                        else:
-                                merged.append(dict(rr))
-                        runs = merged
-
-                        for i, rr in enumerate(runs):
-                            if _dur(rr) >= int(min_exposure_sec):
-                                continue
-                            if i < len(runs) - 1:
-                                # forward merge (extend next run backward)
-                                runs[i + 1]["start"] = int(rr["start"])
-                                runs.pop(i)
-                                changed = True
-                                break
-                            if i > 0:
-                                # backward merge (extend prev run forward)
-                                runs[i - 1]["end"] = int(rr["end"])
-                                runs.pop(i)
-                                changed = True
-                                break
-
-                    # 3) Emit STATE tokens from kept runs (no min-gap throttling; runs already constant).
-                    for run_id, rr in enumerate(runs):
-                        run_start = int(rr["start"])
-                        run_end = int(rr["end"])
-                        run_dur = int(run_end - run_start + 1)
-                        if run_dur < int(min_exposure_sec):
-                            continue
-                        next_reason = "segment_end"
-                        if run_id < len(runs) - 1:
-                            next_reason = _state_change_reason(rr["key"], runs[run_id + 1]["key"])
-                        # Merge rule (sanity): if the run starts at an ENTRY/WINDOW_START token time,
-                        # do NOT emit a duplicate STATE row at the same second. Instead, attach the run metadata
-                        # to that anchor row and set is_outcome_token=1 later.
-                        anchor_at_start: Optional[Dict[str, Any]] = None
-                        for sp in token_specs:
-                            if int(sp.get("t", -1)) == int(run_start) and str(sp.get("type") or "").upper() in ("ENTRY", "WINDOW_START"):
-                                anchor_at_start = sp
-                                break
-                        if anchor_at_start is not None:
-                            anchor_at_start["run_id"] = int(run_id)
-                            anchor_at_start["run_start"] = int(run_start)
-                            anchor_at_start["run_end"] = int(run_end)
-                            anchor_at_start["run_duration"] = int(run_dur)
-                            anchor_at_start["state_changed_reason"] = str(next_reason)
-                            # Optional chunking: emit additional physics slices inside the same run at +H, +2H...
-                            if int(state_chunk_by_h) != 0 and int(horizon_sec) > 0:
-                                tt_emit = int(run_start) + int(horizon_sec)
-                                while int(tt_emit) <= int(run_end):
-                                    token_specs.append(
-                                        {
-                                            "t": int(tt_emit),
-                                            "type": "STATE",
-                                            "seg_idx": seg_idx,
-                                            "seg_s": int(seg_s),
-                                            "seg_true_start": int(seg_true_start),
-                                            "seg_last_on": int(seg_last_on),
-                                            "t_exit": int(t_exit),
-                                            "run_id": int(run_id),
-                                            "run_start": int(run_start),
-                                            "run_end": int(run_end),
-                                            "run_duration": int(run_dur),
-                                            "state_changed_reason": str(next_reason),
-                                        }
-                                    )
-                                    tt_emit += int(horizon_sec)
-                                continue
-                            
-                        # Default: emit exactly ONE STATE token per real regime (run_start).
-                        # Optional: chunk long runs into multiple rows every H seconds (for numerical convenience).
-                        tt_emit = int(run_start)
-                        while True:
-                            token_specs.append(
-                                {
-                                    "t": int(tt_emit),
-                                    "type": "STATE",
-                                    "seg_idx": seg_idx,
-                                    "seg_s": int(seg_s),
-                                    "seg_true_start": int(seg_true_start),
-                                    "seg_last_on": int(seg_last_on),
-                                    "t_exit": int(t_exit),
-                                    "run_id": int(run_id),
-                                    "run_start": int(run_start),
-                                    "run_end": int(run_end),
-                                    "run_duration": int(run_dur),
-                                    "state_changed_reason": str(next_reason),
-                                }
+                        # giveaways / takeaways credited to the actor only
+                        if et in ("giveaway", "takeaway"):
+                            pid_ev = (
+                                det.get("playerId")
+                                or det.get("player_id")
+                                or det.get("actorPlayerId")
                             )
-                            if int(state_chunk_by_h) != 0 and int(horizon_sec) > 0 and (int(tt_emit) + int(horizon_sec) <= int(run_end)):
-                                tt_emit += int(horizon_sec)
-                                continue
-                            break
+                            try:
+                                pid_ev = int(pid_ev) if pid_ev is not None else None
+                            except Exception:
+                                pid_ev = None
+                            if pid_ev is not None and pid_ev == p:
+                                if et == "giveaway":
+                                    gv_p += 1
+                                else:
+                                    tk_p += 1
 
-                if not token_specs:
-                    continue
+                        # hits credited to the hitter only
+                        elif et == "hit":
+                            hit_pid = (
+                                det.get("hittingPlayerId")
+                                or det.get("hitterPlayerId")
+                                or det.get("hitterId")
+                                or det.get("hitter")
+                                or det.get("playerId")
+                            )
+                            try:
+                                hit_pid = int(hit_pid) if hit_pid is not None else None
+                            except Exception:
+                                hit_pid = None
+                            if hit_pid is not None and hit_pid == p:
+                                hp_p += 1
 
-                # Deduplicate exact duplicates of (t, type) and sort deterministically.
-                seen_tt: Dict[Tuple[int, str], Dict[str, Any]] = {}
-                uniq_specs: List[Dict[str, Any]] = []
-                for spec in token_specs:
-                    key = (int(spec["t"]), str(spec["type"]).upper())
-                    spec["type"] = str(spec["type"]).upper()
-                    if key in seen_tt:
-                        continue
-                    seen_tt[key] = spec
-                    uniq_specs.append(spec)
-                kept_specs = sorted(uniq_specs, key=lambda d: (int(d["t"]), _tok_prio(str(d["type"]))))
+                        # blocks credited to the blocker only
+                        elif et == "blocked-shot":
+                            blk_pid = (
+                                det.get("blockingPlayerId")
+                                or det.get("blockedByPlayerId")
+                                or det.get("blockerPlayerId")
+                                or det.get("blockerId")
+                                or det.get("playerId")
+                            )
+                            try:
+                                blk_pid = int(blk_pid) if blk_pid is not None else None
+                            except Exception:
+                                blk_pid = None
+                            if blk_pid is not None and blk_pid == p:
+                                bp_p += 1
+                row["giveaways_committed"] = int(gv_p)
+                row["takeaways_forced"] = int(tk_p)
+                row["hits_personal"] = int(hp_p)
+                row["blocks_personal"] = int(bp_p)
+                # standings/b2b on player rows (cached per team)
+                tid_player = home_team_id if side=="home" else away_team_id
+                rank_prior_p, b2b_calc_p, rest_days_calc_p = compute_standings_and_b2b(tid_player)
+                if rank_prior_p is not None:
+                    row["standing_prior"] = int(rank_prior_p)
+                if b2b_calc_p is not None:
+                    row["b2b_team"] = int(bool(b2b_calc_p))
+                if rest_days_calc_p is not None:
+                    row["rest_days_team"] = int(rest_days_calc_p)
+                # Faceoff flags at window start (player + team + taker)
+                won_tid = w.get("fo_won_team_id")
+                # Treat presence of fo_won_team_id as authoritative indicator that this window starts on a faceoff
+                is_fo_start = (won_tid is not None)
+                team_tid = (home_team_id if side == "home" else away_team_id)
+                ids_start_set = set(w.get(f"{side}_ids_start", []) or [])
+                fo_seen_start_val = int(1 if (is_fo_start and (p in ids_start_set)) else 0)
+                team_won = bool(is_fo_start and (team_tid is not None) and int(won_tid) == int(team_tid))
+                team_lost = bool(is_fo_start and (team_tid is not None) and int(won_tid) != int(team_tid))
+                # Taker IDs from window metadata
+                taker_win_pid = None
+                taker_lose_pid = None
+                try:
+                    taker_win_pid = int(w.get("fo_won_player_id")) if w.get("fo_won_player_id") is not None else None
+                except Exception:
+                    taker_win_pid = None
+                try:
+                    taker_lose_pid = int(w.get("fo_lost_player_id")) if w.get("fo_lost_player_id") is not None else None
+                except Exception:
+                    taker_lose_pid = None
+                took = bool(is_fo_start and (p == taker_win_pid or p == taker_lose_pid))
+                took_won = bool(is_fo_start and (p == taker_win_pid))
+                took_lost = bool(is_fo_start and (p == taker_lose_pid))
+                row.update({
+                    # Player present for FO at window start
+                    "fo_seen_start": int(fo_seen_start_val),
+                    # Team-level explicit flags (00/01)
+                    "fo_team_won_start": int(1 if (fo_seen_start_val and team_won) else 0),
+                    "fo_team_lost_start": int(1 if (fo_seen_start_val and team_lost) else 0),
+                    # Back-compat names (if present elsewhere)
+                    "fo_won_start": int(1 if (fo_seen_start_val and team_won) else 0),
+                    "fo_lost_start": int(1 if (fo_seen_start_val and team_lost) else 0),
+                    # Taker flags
+                    "fo_took_start": int(1 if took else 0),
+                    "fo_took_won_start": int(1 if took_won else 0),
+                    "fo_took_lost_start": int(1 if took_lost else 0),
+                })
+                # Early mass dose: only weight early seconds if player actually took/was on for the FO
+                try:
+                    row["early_mass"] = float(int(fo_seen_start_int)) * float(elap.get("elapsed_share_0_5", 0.0))
+                except Exception:
+                    row["early_mass"] = 0.0
+                # Pure pre-change instruments at window start (no realized overlap applied)
+                try:
+                    row["ai_OZ_start"] = int(row.get("after_icing_by_opponent", 0)) * int(fo_seen_start_int)
+                except Exception:
+                    row["ai_OZ_start"] = 0
+                try:
+                    row["ai_DZ_start"] = int(row.get("after_icing_by_team", 0)) * int(fo_seen_start_int)
+                except Exception:
+                    row["ai_DZ_start"] = 0
+                try:
+                    row["fo_O_start"] = int(_zone_rel_p == "OZ") * int(fo_seen_start_int)
+                except Exception:
+                    row["fo_O_start"] = 0
+                try:
+                    row["fo_D_start"] = int(_zone_rel_p == "DZ") * int(fo_seen_start_int)
+                except Exception:
+                    row["fo_D_start"] = 0
+                try:
+                    row["last_change_start"] = int(home_last_change_opportunity_flag) * int(fo_seen_start_int)
+                except Exception:
+                    row["last_change_start"] = 0
+                # Force: home iced into DZ → no last change, regardless of FO participation
+                try:
+                    if (side == "home" and int(row.get("after_icing_by_team", 0)) == 1 and str(row.get("zone_start")) == "DZ"):
+                        row["last_change_start"] = 0
+                        row["home_last_change_opportunity"] = 0
+                except Exception:
+                    pass
+                try:
+                    row["long_change_start"] = int(is_long_change(start_s)) * int(fo_seen_start_int)
+                except Exception:
+                    row["long_change_start"] = 0
+                # pulled-goalie exposure for player rows
+                row.update({
+                    "pulled_goalie_start": int(bool(w["goalies_start"][side] == 0)),
+                    "goalie_pulled_since": int(since_pulled_home[start_s] if side=="home" else since_pulled_away[start_s]),
+                })
+                player_rows.append(row)
 
-                for token_idx, spec in enumerate(kept_specs):
-                    t_tok = int(spec["t"])
-                    tok_type = str(spec["type"])
-                    seg_idx = int(spec["seg_idx"])
-                    seg_s = int(spec["seg_s"])
-                    seg_true_start = int(spec.get("seg_true_start", seg_s))
-                    seg_last_on = int(spec["seg_last_on"])
-                    t_exit = int(spec["t_exit"])
-                    # For EXIT tokens, keep t_token at seg_exit (first off-ice second),
-                    # but compute "context-at-token" covariates from the last on-ice second.
-                    t_context = int(seg_last_on) if str(tok_type).upper() == "EXIT" else int(t_tok)
-                    # For PRE roster snapshots (CIN inputs), use decision-time roster at t_token for most tokens,
-                    # but for EXIT tokens use the just-before-exit roster at t_context (last on-ice second).
-                    t_roster = int(t_context) if str(tok_type).upper() == "EXIT" else int(t_tok)
+    # -------- EA/EN prune (drop shards <6s with zero credited events) --------
+    def window_zero_events(start_s: int, end_s: int) -> bool:
+        for s in range(start_s, end_s):
+            cb = credit_by_sec.get(s)
+            if not cb: continue
+            if cb["home"] or cb["away"]:
+                return False
+        return True
 
-                    # Horizon/exposure contract:
-                    # - All non-EXIT tokens must NOT include any off-ice seconds in their target interval.
-                    #   Because targets are counted in (t_token, t_end] (inclusive of t_end), we cap at seg_last_on.
-                    # - STATE tokens are additionally capped by the end of their constant-state run (run_end),
-                    #   so their targets do not mix different matchup states.
-                    has_run = spec.get("run_end") is not None
-                    if has_run:
-                        run_end = int(spec.get("run_end", seg_last_on))
-                        if int(state_chunk_by_h) != 0 and str(tok_type).upper() == "STATE":
-                            # Chunked interior physics rows use H, still capped at run_end.
-                            t_end = min(int(end_s), int(t_tok) + int(horizon_sec), int(seg_last_on), int(run_end))
-                            else:
-                            # One row per real regime (and merged ENTRY/WINDOW_START-at-run-start rows) uses full run.
-                            t_end = min(int(end_s), int(seg_last_on), int(run_end))
-                    elif str(tok_type).upper() == "EXIT":
-                        t_end = min(int(end_s), int(t_tok) + int(horizon_sec))
-                    else:
-                        t_end = min(int(end_s), int(t_tok) + int(horizon_sec), int(seg_last_on))
-                    seconds_token = int(t_end) - int(t_tok)
-                    # Keep STATE rows even if seconds_token==0 (e.g., a 1-second state right before exit).
-                    # These are useful for logging state transitions; they should be excluded from outcome loss via is_outcome_token.
-                    if seconds_token <= 0 and str(tok_type).upper() not in ("EXIT", "STATE"):
-                        continue
+    kept_team_rows = []
+    for r in team_rows:
+        is_ea = (r["strength_team"] in ("EA","EN_for"))
+        if is_ea and (r["duration"] < EA_PRUNE_MIN) and window_zero_events(r["start_sec"], r["end_sec"]):
+            continue
+        kept_team_rows.append(r)
+    team_rows = kept_team_rows
 
-                    our_set, opp_set = _onice_sets_at(int(t_roster), side)
-                    teammates_ids = sorted(int(x) for x in (our_set - {p}))
-                    opponents_ids = sorted(int(x) for x in opp_set)
-                    own_goalie_id, opp_goalie_id = _goalie_ids_at(int(t_roster), side)
+    kept_player_rows = []
+    keep_key = {(r["window_id"], r["team_side"]): True for r in team_rows}
+    for r in player_rows:
+        key = (r["window_id"], r["team_side"])
+        if key not in keep_key:
+            continue
+        kept_player_rows.append(r)
+    player_rows = kept_player_rows
 
-                    # CIN-friendly fixed roster slots (skaters only). Use up to 6 to handle EN 6v5.
-                    team_skaters_sorted = sorted(int(x) for x in our_set)
-                    opp_skaters_sorted = sorted(int(x) for x in opp_set)
-                    num_team_skaters = int(len(team_skaters_sorted))
-                    num_opp_skaters = int(len(opp_skaters_sorted))
+    return windows, team_rows, player_rows
 
-                    def _slots(arr: List[int], k: int) -> List[int]:
-                        out = arr[:k]
-                        if len(out) < k:
-                            out = out + [0] * (k - len(out))
-                        return out
+# -------------------- Writers --------------------
+def write_json_pretty(objs: List[Dict[str,Any]], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(objs, f, ensure_ascii=False, indent=2)
 
-                    team_slots = _slots(team_skaters_sorted, 6)
-                    opp_slots = _slots(opp_skaters_sorted, 6)
-
-                    strength_g = str(w.get("strength_global"))
-                    strength_team = _strength_team_at(int(t_context), side)
-
-                    outcomes = aggregate_features_for_token(
-                        game=game,
-                        by_sec_home=by_sec_home,
-                        by_sec_away=by_sec_away,
-                        events_by_sec=events_by_sec,
-                        credit_by_sec=credit_by_sec,
-                        team_onice_by_sec=team_onice_by_sec,
-                        orders_by_sec=orders_by_sec,
-                        shift_changes_by_sec=shift_changes_by_sec,
-                        side=side,
-                        p=int(p),
-                        win_start=int(start_s),
-                        win_end=int(end_s),
-                        t_token=int(t_tok),
-                        t_end=int(t_end),
-                    )
-                    seconds_onice_in_h = int(outcomes.get("seconds_onice_in_h", 0) or 0)
-                    score_diff_tok = score_diff_for_side(side, t_context)
-
-                    sim_features = {
-                        "period": int(period_of(t_context)),
-                        "clock_s": int(clock_s_at(t_context)),
-                        "home_away": bool(side == "home"),
-                        "long_change": int(is_long_change(t_context)),
-                        "strength_team": strength_team,
-                        # score_diff at "context time" (for EXIT tokens, this is just-before-exit)
-                        "score_diff": int(score_diff_for_side(side, t_context)),
-                    }
-                    # "Last meaningful event" context (exclude shift-change; must be close enough to matter).
-                    last_et, last_es, last_dt, last_lb, last_z, last_owner_tid = last_non_shift_event_before_adaptive(
-                        t_context=int(t_context),
-                        events_by_sec=events_by_sec,
-                        lookback_primary_sec=6,
-                        lookback_extended_sec=10,
-                    )
-                    sim_features.update(
-                        {
-                            "last_event_type": str(last_et),
-                            "time_since_last_event_s": int(last_dt),
-                            "last_event_sec": int(last_es),
-                            "last_event_lookback_s": int(last_lb),
-                            "last_event_zone": str(last_z),
-                            "last_event_owner_team_id": int(last_owner_tid),
-                        }
-                    )
-
-                    # Shift-change reasoning proxy (fatigue + situation)
-                    shift_elapsed = int(onice_elapsed_before_second(p, int(t_context), onice_map))
-                    mean_len, sd_len, n_prev = shift_mean_sd_before(
-                        shift_stats_home if side == "home" else shift_stats_away,
-                        int(p),
-                        int(t_context),
-                    )
-                    # Token-local goalie pulled flags & transitions (high confidence from per-second snapshots)
-                    # IMPORTANT: goalie pulled means the goalie is not on-ice (goalie_id == 0), regardless of skater count.
-                    # (You can be shorthanded and still pull the goalie; then skaters may be 5, goalie_id==0.)
-                    own_pulled = int(1 if int(own_goalie_id) == 0 else 0)
-                    opp_pulled = int(1 if int(opp_goalie_id) == 0 else 0)
-                    own_prev_pulled = 0
-                    opp_prev_pulled = 0
-                    if int(t_context) - 1 >= 0:
-                        prev_our, prev_opp = _onice_sets_at(int(t_context) - 1, side)
-                        prev_own_gid, prev_opp_gid = _goalie_ids_at(int(t_context) - 1, side)
-                        own_prev_pulled = int(1 if int(prev_own_gid) == 0 else 0)
-                        opp_prev_pulled = int(1 if int(prev_opp_gid) == 0 else 0)
-                    own_pull_trans = int(1 if own_prev_pulled != own_pulled else 0)
-                    opp_pull_trans = int(1 if opp_prev_pulled != opp_pulled else 0)
-
-                    # Period boundary (very high confidence shift termination context)
-                    clk = int(clock_s_at(int(t_context)))
-                    is_period_boundary = int(1 if (clk <= 2 or clk >= (SECONDS_PER_PERIOD - 2)) else 0)
-
-                    # Boundary-only container break context (helps detect strength-change driven swaps cleanly)
-                    boundary_prev_break_type = str(w.get("start_prev_break_type") or "") if int(t_tok) == int(start_s) else ""
-                    sim_features.update(
-                        {
-                            "shift_elapsed_s": int(shift_elapsed),
-                            "shift_prev_n": int(n_prev),
-                            "shift_prev_mean_len_s": float(mean_len) if mean_len is not None else None,
-                            "shift_prev_sd_len_s": float(sd_len) if sd_len is not None else None,
-                        }
-                    )
-                    bundle = reason_proxy_bundle(
-                        token_type=str(tok_type),
-                        t_token=int(t_tok),
-                        t_context=int(t_context),
-                        strength_team=str(strength_team),
-                        score_diff=int(score_diff_for_side(side, t_context)),
-                        last_event_type=str(last_et),
-                        last_event_owner_team_id=int(last_owner_tid),
-                        our_team_id=int(team_id),
-                        last_event_zone=str(last_z),
-                        current_shift_elapsed_s=int(shift_elapsed),
-                        mean_shift_len_s=mean_len,
-                        sd_shift_len_s=sd_len,
-                        position_code=str(player_pos_map.get(int(p)) or ""),
-                        is_period_boundary=int(is_period_boundary),
-                        own_goalie_pulled=int(own_pulled),
-                        opp_goalie_pulled=int(opp_pulled),
-                        own_goalie_pull_transition=int(own_pull_trans),
-                        opp_goalie_pull_transition=int(opp_pull_trans),
-                        boundary_prev_break_type=str(boundary_prev_break_type),
-                    )
-                    # Focus on EXIT for "why did he leave", but expose change-token proxy too.
-                    lbl = str(bundle.get("label") or "na")
-                    conf = float(bundle.get("confidence") or 0.0)
-                    sim_features["exit_reason_proxy_pre"] = lbl if str(tok_type).upper() == "EXIT" else "na"
-                    sim_features["change_reason_proxy_pre"] = (
-                        lbl if str(tok_type).upper() in ("ENTRY", "EXIT", "STATE") else "na"
-                    )
-                    sim_features["exit_reason_conf_pre"] = float(conf) if str(tok_type).upper() == "EXIT" else 0.0
-                    sim_features["change_reason_conf_pre"] = float(conf) if str(tok_type).upper() in ("ENTRY", "EXIT", "STATE") else 0.0
-                    # Evidence flags (always safe as PRE; helps you filter to high-confidence subsets)
-                    for fk in (
-                        "is_special_teams","is_after_faceoff","is_after_stoppage","is_after_icing","is_after_goal","is_after_penalty",
-                        "is_period_boundary","own_goalie_pulled","opp_goalie_pulled","own_goalie_pull_transition","opp_goalie_pull_transition","boundary_prev_break_type",
-                        "zone_O","zone_D","zone_N","score_big","fatigue_z","shift_elapsed_s","shift_mean_s",
-                    ):
-                        if fk in bundle:
-                            sim_features[f"reason_{fk}"] = bundle[fk]
-
-                    last_len, rest_gap = last_shift_and_rest_before(p, int(t_context), onice_map)
-                    train_features = dict(sim_features)
-                    train_features.update(
-                        {
-                            "last_shift_len_s": int(last_len),
-                            "time_since_last_shift_s": int(rest_gap),
-                            "entry_offset_s": int(int(t_context) - int(seg_s)),
-                        }
-                    )
-
-                    # Exit hazard targets for tokens inside this segment (EXIT tokens have 0).
-                    exit_time_s = int(max(0, int(t_exit) - int(t_tok)))
-                    exit_event_within_h = int(1 if (exit_time_s > 0 and exit_time_s <= int(seconds_token)) else 0)
-                    exit_time_to_exit_s = int(exit_time_s) if exit_event_within_h else int(max(0, seconds_token))
-
-                    # Replacement labeling for EXIT token: entrants on player's team at t_exit vs t_exit-1
-                    replacement1_id = 0
-                    replacement2_id = 0
-                    replacement_count = 0
-                    if str(tok_type).upper() == "EXIT":
-                        t_prev = max(int(start_s), min(int(t_tok) - 1, int(end_s) - 1))
-                        t_next = max(int(start_s), min(int(t_tok), int(end_s)))
-                        if 0 <= t_prev < len(team_onice_by_sec) and 0 <= t_next < len(team_onice_by_sec):
-                            home_prev, away_prev = team_onice_by_sec[t_prev]
-                            home_next, away_next = team_onice_by_sec[t_next]
-                            prev_team = set(home_prev) if side == "home" else set(away_prev)
-                            next_team = set(home_next) if side == "home" else set(away_next)
-                            entrants = sorted(int(x) for x in (next_team - prev_team))
-                            replacement_count = int(len(entrants))
-                            if len(entrants) >= 1:
-                                replacement1_id = int(entrants[0])
-                            if len(entrants) >= 2:
-                                replacement2_id = int(entrants[1])
-
-                    row = {
-                        "season": season,
-                        "date": date,
-                        "gamePk": int(game.gamePk),
-                        "teamId": int(team_id),
-                        "team_side": side,
-                        "window_id": win_id,
-                        "strength_global": strength_g,
-                        "playerId": int(p),
-                        "token_idx": int(token_idx),
-                        "token_type": str(tok_type),
-                        "rc_side": "na",
-                        "t_token": int(t_tok),
-                        "t_context": int(t_context),
-                        "t_end": int(t_end),
-                        "seconds_token": int(seconds_token),
-                        "seconds_onice_in_h": int(seconds_onice_in_h),
-                        "is_outcome_token": int(1 if (has_run and int(seconds_token) > 0) else 0),
-                        "is_selection_token": int(1 if str(tok_type).upper() in ("ENTRY", "WINDOW_START") else 0),
-                        "is_hazard_token": int(1 if str(tok_type).upper() == "EXIT" else 0),
-                        "positionCode": (player_pos_map.get(int(p)) or ""),
-                        "playerName": (player_name_map.get(int(p)) or ""),
-                        # segment index (useful for joining/diagnostics; keep lightweight)
-                        "seg_idx": int(seg_idx),
-                        # STATE run metadata (audit-friendly; only filled for STATE tokens)
-                        "run_id": (int(spec.get("run_id")) if has_run and spec.get("run_id") is not None else None),
-                        "run_start": (int(spec.get("run_start")) if has_run and spec.get("run_start") is not None else None),
-                        "run_end": (int(spec.get("run_end")) if has_run and spec.get("run_end") is not None else None),
-                        "run_duration": (int(spec.get("run_duration")) if has_run and spec.get("run_duration") is not None else None),
-                        "state_changed_reason": (str(spec.get("state_changed_reason") or "") if has_run else None),
-                        # How long this exact state persists starting at t_token (inclusive), in seconds.
-                        # This is the quantity you want when micro-changes exist: a 2-second “reality” gets persist=2.
-                        "state_persist_sec": (int(int(spec.get("run_end")) - int(t_tok) + 1) if has_run and spec.get("run_end") is not None else None),
-                        "bench_rest_bucket": _bench_rest_bucket(int(rest_gap)) if str(tok_type).upper() == "ENTRY" else "na",
-                        "entry_after_faceoff_flag": int(1 if (str(tok_type).upper() == "ENTRY" and int(t_tok) in fo_meta) else 0),
-                        # bench availability pressure (sim-safe; derived from roster availability at t_token)
-                        "bench_size_at_t": int(len((home_seen if side == "home" else away_seen) - set(our_set))),
-                        # PRE roster at decision time (CIN inputs) - fixed slots only
-                        "num_team_skaters": num_team_skaters,
-                        "num_opp_skaters": num_opp_skaters,
-                        "team_slot1": int(team_slots[0]),
-                        "team_slot2": int(team_slots[1]),
-                        "team_slot3": int(team_slots[2]),
-                        "team_slot4": int(team_slots[3]),
-                        "team_slot5": int(team_slots[4]),
-                        "team_slot6": int(team_slots[5]),
-                        "opp_slot1": int(opp_slots[0]),
-                        "opp_slot2": int(opp_slots[1]),
-                        "opp_slot3": int(opp_slots[2]),
-                        "opp_slot4": int(opp_slots[3]),
-                        "opp_slot5": int(opp_slots[4]),
-                        "opp_slot6": int(opp_slots[5]),
-                        "own_goalie_id": int(own_goalie_id),
-                        "opp_goalie_id": int(opp_goalie_id),
-                        # exit supervision targets (use for selection/exit heads; censored with seconds_token)
-                        "exit_event_within_h": int(exit_event_within_h),
-                        "exit_time_to_exit_s": int(exit_time_to_exit_s),
-                        "exit_reason_proxy": _exit_reason_proxy(side, int(t_exit)) if str(tok_type).upper() == "EXIT" else "na",
-                        "replacement1_id": int(replacement1_id),
-                        "replacement2_id": int(replacement2_id),
-                        "replacement_count": int(replacement_count),
-                        # Use true on-ice exposure (not just horizon length) for TOI offsets.
-                        "offset_log_toi": float(math.log(max(1, int(seconds_onice_in_h)))),
-                        "rinkid": rinkid,
-                        **outcomes,
-                    }
-
-                    # Carry window/container instruments into every token row (prefixed win_*)
-                    # These are decision-time instruments (deployment signals) and safe as PRE inputs.
-                    win_prev_type = str(w.get("start_prev_break_type") or "")
-                    win_prev_team = w.get("start_prev_break_team_id")
-                    win_fo_zone = str(w.get("fo_zone") or "flow")
-                    # home last change opportunity (rule-based; conservative)
-                    win_home_last_change = False
-                    try:
-                        if side == "home":
-                            spbt = win_prev_type.lower()
-                            fo_expected = (spbt in stoppage_types_for_last_change)
-                            excluded = spbt in {"strength", "hard_cap", "flow", ""}
-                            win_home_last_change = bool(fo_expected and not excluded and win_fo_zone.lower() != "flow")
-                            # If home committed icing, cannot change
-                            if spbt == "icing" and win_prev_team is not None and int(win_prev_team) == int(game.home_team_id):
-                                win_home_last_change = False
-            except Exception:
-                        win_home_last_change = False
-                    row.update(
-                        {
-                            "win_start_sec": int(w.get("start_sec", 0) or 0),
-                            "win_home_goalie_present": int(w.get("home_goalie_present", 0) or 0),
-                            "win_away_goalie_present": int(w.get("away_goalie_present", 0) or 0),
-                            "win_home_goalie_pulled": int(w.get("home_goalie_pulled", 0) or 0),
-                            "win_away_goalie_pulled": int(w.get("away_goalie_pulled", 0) or 0),
-                            "win_fo_zone": win_fo_zone,
-                            "win_fo_won_team_id": int(w.get("fo_won_team_id") or 0),
-                            "win_start_prev_break_type": win_prev_type,
-                            "win_start_prev_break_team_id": int(win_prev_team or 0),
-                            "win_start_prev_break_subtype": str(w.get("start_prev_break_subtype") or "none") or "none",
-                            "win_media_timeout_start": int(w.get("media_timeout_start", 0) or 0),
-                            "win_home_last_change_opportunity": int(1 if win_home_last_change else 0),
-                            # token-local (at/before t_token) last faceoff zone
-                            "tok_last_fo_zone": str(last_fo_zone_by_sec.get(int(t_context), "flow")),
-                            # audit helper: distinguish boundary-driven churn vs within-window roster evolution
-                            "is_boundary_second": int(1 if int(t_tok) == int(w.get("start_sec", 0) or 0) else 0),
-                        }
-                    )
-
-                    if m in ("sim", "both"):
-                        for k, v in sim_features.items():
-                            row[f"sim_{k}"] = v
-                    if m in ("train", "both"):
-                        for k, v in train_features.items():
-                            row[f"train_{k}"] = v
-
-                    rows.append(row)
-
-    # Deterministic global ordering for auditability & train/test split discipline.
-    rows.sort(
-        key=lambda r: (
-            str(r.get("window_id") or ""),
-            int(r.get("playerId") or 0),
-            int(r.get("t_token") or 0),
-            int(TOKEN_PRIORITIES.get(str(r.get("token_type") or "").upper(), 999)),
-        )
-    )
-    return rows
-
-
-def extract_roster_change_token_times(
-    *,
-    windows: List[Dict[str, Any]],
-    by_sec_home: Dict[int, set],
-    by_sec_away: Dict[int, set],
-    shift_changes_by_sec: Dict[int, Dict[str, set]],
-    min_swap: int,
-    min_gap_sec: int,
-    stable_sec: int,
-    rc_require_stable: int,
-    post_dwell_sec: int,
-    mass_swap_suppress_threshold: int,
-) -> Dict[Tuple[str, int, str], List[int]]:
-    """
-    Fast extractor: compute kept ROSTER_CHANGE token times per (window_id, playerId, team_side),
-    using the exact same debounce/min-gap/mass-swap rules as generate_tokens_and_rows, but without
-    computing any outcomes or writing full rows.
-    """
-    out: Dict[Tuple[str, int, str], List[int]] = defaultdict(list)
-    mass_swap_th = max(0, int(mass_swap_suppress_threshold))
-    stable_sec_i = int(stable_sec)
-    require_stable = int(rc_require_stable) != 0
-    post_dwell_i = max(0, int(post_dwell_sec))
-
-    for w in windows:
-        win_id = str(w.get("window_id") or "")
-        start_s = int(w.get("start_sec") or 0)
-        end_s = int(w.get("end_sec") or 0)
-        if end_s <= start_s:
-                                continue
-
-        for side in ("home", "away"):
-            onice_map = by_sec_home if side == "home" else by_sec_away
-            # collect players who appear onice at least once in window
-            players_in_window: set = set()
-            for s in range(int(start_s), int(end_s)):
-                players_in_window.update(int(x) for x in (onice_map.get(int(s)) or set()))
-            if not players_in_window:
-                            continue
-
-            for p in sorted(players_in_window):
-                # seconds on-ice for this player in the window
-                # Window bounds are treated as half-open [start_sec, end_sec) for token membership.
-                secs_on = [s for s in range(int(start_s), int(end_s)) if p in (onice_map.get(int(s)) or set())]
-                if not secs_on:
-                    continue
-                secs_on.sort()
-
-                # build contiguous segments
-                segments: List[Tuple[int, int]] = []
-                seg_start = secs_on[0]
-                prev_s = secs_on[0]
-                for s in secs_on[1:]:
-                    if s == prev_s + 1:
-                        prev_s = s
-                        continue
-                    segments.append((int(seg_start), int(prev_s)))
-                    seg_start = s
-                    prev_s = s
-                segments.append((int(seg_start), int(prev_s)))
-
-                kept_all: List[int] = []
-                for seg_s, seg_last_on in segments:
-                    prev_team = set(onice_map.get(int(seg_s), set())) - {p}
-
-                    def stable_team_at(ss: int) -> Optional[set]:
-                        if stable_sec_i <= 1:
-                            return set(onice_map.get(int(ss), set())) - {p}
-                        last = None
-                        for tt in range(int(ss), int(ss) + int(stable_sec_i)):
-                            if tt > int(seg_last_on):
-            return None
-                            if p not in (onice_map.get(int(tt), set()) or set()):
-        return None
-                            cur = set(onice_map.get(int(tt), set())) - {p}
-                            if last is None:
-                                last = cur
-                            elif cur != last:
-                                return None
-                        return last
-
-                    s = int(seg_s) + 1
-                    candidates: List[int] = []
-                    while s <= int(seg_last_on):
-                        if p not in (onice_map.get(int(s), set()) or set()):
-                            s += 1
-                        continue
-                        sc = shift_changes_by_sec.get(int(s)) or {}
-                        explicit_shift = bool(sc.get(f"{side}_in") or sc.get(f"{side}_out"))
-                        inferred_shift = bool((onice_map.get(int(s), set()) or set()) != (onice_map.get(int(s) - 1, set()) or set()))
-                        if not (explicit_shift or inferred_shift):
-                            s += 1
-                        continue
-
-                        if mass_swap_th > 0 and int(s) - 1 >= 0:
-                            prev_on = set(onice_map.get(int(s) - 1, set()) or set())
-                            now_on = set(onice_map.get(int(s), set()) or set())
-                            swap_count = len(now_on - prev_on) + len(prev_on - now_on)
-                            if int(swap_count) >= int(mass_swap_th):
-                                s += 1
-                        continue
-
-                        team_now = set(onice_map.get(int(s), set()) or set()) - {p}
-                        if len(team_now.symmetric_difference(prev_team)) < int(min_swap):
-                            s += 1
-                        continue
-
-                        emit_t = int(s)
-                        if stable_sec_i > 1:
-                            found = False
-                            for ss in range(int(s), int(seg_last_on) + 1):
-                                st = stable_team_at(int(ss))
-                                if st is None:
-                        continue
-                                if post_dwell_i > 0:
-                                    ok_pd = True
-                                    for tt in range(int(ss), int(ss) + int(post_dwell_i) + 1):
-                                        if tt > int(seg_last_on) or p not in (onice_map.get(int(tt), set()) or set()):
-                                            ok_pd = False
-                                            break
-                                    if not ok_pd:
-                        continue
-                                if len(set(st).symmetric_difference(prev_team)) >= int(min_swap):
-                                    emit_t = int(ss)
-                                    team_now = set(st)
-                                    found = True
-                                    break
-                            if not found:
-                                if require_stable:
-                                    s += 1
-                                continue
-                                emit_t = int(s)
-                                team_now = set(onice_map.get(int(s), set()) or set()) - {p}
-
-                        candidates.append(int(emit_t))
-                        prev_team = set(team_now)
-                        s = int(emit_t) + 1
-
-                    # min-gap between RC tokens within this segment/player
-                    candidates = sorted(dict.fromkeys(int(x) for x in candidates))
-                    kept: List[int] = []
-                    last_kept = None
-                    for tt in candidates:
-                        if last_kept is None or int(tt) - int(last_kept) >= int(min_gap_sec):
-                            kept.append(int(tt))
-                            last_kept = int(tt)
-                    kept_all.extend(kept)
-
-                kept_all = sorted(dict.fromkeys(int(x) for x in kept_all))
-                if kept_all:
-                    out[(win_id, int(p), side)] = kept_all
-
-    return out
-
+def write_csv(path: str, rows: List[Dict[str,Any]], keys: List[str]) -> None:
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            row = {k: r.get(k) for k in keys}
+            for k, v in list(row.items()):
+                if isinstance(v, list):
+                    row[k] = "|".join(str(x) for x in v)
+            w.writerow(row)
 
 # -------------------- Main --------------------
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Build window containers and tokenized player rows (CSV-only).")
+def main():
+    ap = argparse.ArgumentParser(description="Build windows + team/player rows from pbp_onice JSON.")
     ap.add_argument("--in", dest="in_path", required=True, help="Path to pbp_onice_<gamePk>.json")
     ap.add_argument("--out_dir", required=True, help="Output directory")
-    ap.add_argument("--hard_cap_sec", type=int, default=0, help="Force container breaks every N seconds (0 = disabled)")
-    ap.add_argument("--horizon-sec", type=int, default=20, help="Token horizon in seconds (default 20)")
-    ap.add_argument("--min-exposure-sec", type=int, default=1, help="STATE tokenization: minimum run exposure in seconds to emit STATE tokens (default 1; use 5+ to suppress micro states)")
-    ap.add_argument("--state-stable-sec", type=int, default=1, help="STATE tokenization: optional dwell (seconds) required before accepting a new state (default 1; >1 debounces flicker)")
-    ap.add_argument("--state-chunk-by-h", type=int, default=0, help="If 1, split long STATE runs into multiple STATE rows every H seconds. Default 0 (one STATE per real lineup regime).")
-    ap.add_argument("--schema", choices=["slim", "full"], default="slim", help="Output schema for player_tokens_pre: slim keeps only required columns; full includes all diagnostic sim_reason_* fields and any extra columns (default slim).")
-    ap.add_argument("--min-swap", type=int, default=2, help="ROSTER_CHANGE threshold (default 2)")
-    ap.add_argument("--min-gap-sec", type=int, default=8, help="Minimum seconds between kept ROSTER_CHANGE tokens (default 8)")
-    ap.add_argument("--stable-sec", type=int, default=2, help="Debounce ROSTER_CHANGE: require teammate set stable for N seconds before emitting (<=1 disables; default 2)")
-    ap.add_argument(
-        "--matchup-stable-sec",
-        type=int,
-        default=6,
-        help=(
-            "When --opp-change-tokens=1, require BOTH teammate+opponent sets to remain unchanged for N seconds "
-            "before emitting a ROSTER_CHANGE (suppresses short-lived opponent response flicker). Default 6."
-        ),
-    )
-    ap.add_argument("--rc-require-stable", type=int, default=1, help="If 1, drop ROSTER_CHANGE candidates that never become stable before segment end (prevents 1-second flicker tokens). Default 1.")
-    ap.add_argument("--post-dwell-sec", type=int, default=2, help="Require player remains on-ice for N seconds after emitted ROSTER_CHANGE time (default 2).")
-    ap.add_argument("--mass-swap-suppress-threshold", type=int, default=3, help="If >=3 skaters swap on a side at a second, suppress ROSTER_CHANGE emission at that second (anchors cover it). Default 3.")
-    ap.add_argument("--opp-change-tokens", type=int, default=0, help="If 1, also emit opponent-driven context updates as ROSTER_CHANGE tokens tagged rc_side=opp (same debounce/min-gap rules). Default 0.")
-    ap.add_argument("--opp-cover-gap-sec", type=int, default=4, help="Coverage suppression for opponent-driven updates: skip rc_side=opp ROSTER_CHANGE if any token was emitted within the last N seconds. Default 4.")
-    ap.add_argument("--max-tokens", type=int, default=10, help="Max tokens per player per window (default 10)")
-    ap.add_argument("--mode", choices=["train", "sim", "both"], default="both", help="Which feature namespaces to output")
-    ap.add_argument("--season", default="", help="Optional season label to stamp into CSVs (e.g., 20252026)")
-    ap.add_argument("--date", default="", help="Optional game date to stamp into CSVs (YYYY-MM-DD)")
-    ap.add_argument("--rinkid", default="", help="Optional rink id/name to stamp into CSVs")
-    ap.add_argument("--player-meta-csv", default="artifacts/player_career_years_2017_2025.csv", help="Fallback player metadata CSV to fill playerName/positionCode if raw boxscore/shiftcharts are unavailable. Use empty string to disable.")
-    ap.add_argument("--player-landing-cache-dir", default="artifacts/cache/player_landing", help="Cache directory for api-web player landing JSON (used for handedness/age enrichment).")
-    ap.add_argument("--fetch-player-landing", type=int, default=1, help="If 1, fetch missing player landing JSON from api-web (cached). If 0, never fetch and leave age blank if unknown. Default 1.")
-    ap.add_argument("--write-parquet", type=int, default=1, help="If 1, also write player_tokens_pre_{gamePk}.parquet (default 1).")
-    ap.add_argument("--write-windows", action="store_true", help="Also write windows_{gamePk}.csv (containers)")
-    ap.add_argument("--write-post", action="store_true", help="Also write player_tokens_post_{gamePk}.csv (post-horizon evidence; do NOT use as PRE inputs)")
-    ap.add_argument("--entry-negatives", type=int, default=0, help="If >0, also write entry_selection_{gamePk}.csv with N negative candidates per ENTRY token")
+    ap.add_argument("--csv", action="store_true", help="Also write CSVs")
+    ap.add_argument("--hard-cap-sec", type=int, default=0, help="Optional hard cap in seconds (0=off)")
+    ap.add_argument("--home_team_id", type=int, default=None, help="Optional: home team id for directional credit")
+    ap.add_argument("--away_team_id", type=int, default=None, help="Optional: away team id for directional credit")
+    ap.add_argument("--players-json", type=str, default=None, help="Optional player map JSON (id->name or list of players)")
+    ap.add_argument("--boxscore-json", type=str, default=None, help="Optional boxscore JSON (will extract playerId->name)")
+    ap.add_argument("--standings_dir", type=str, default=None, help="Directory with standings CSVs (game_results_*.csv, standings_by_date_*.csv)")
+    ap.add_argument("--debug-ga", action="store_true", help="Print detailed reasoning whenever a player is assigned GA")
+    ap.add_argument("--debug-standings", action="store_true", help="Debug prints for standings/b2b derivation")
+    ap.add_argument("--csv_only_player_train", action="store_true", help="When --csv is set, only write player_windows_train_<gamePk>.csv")
     args = ap.parse_args()
+    # seed globals for helper discovery
+    global CLI_IN_PATH, CLI_STANDINGS_DIR
+    CLI_IN_PATH = args.in_path
+    CLI_STANDINGS_DIR = args.standings_dir
+    # helper: discover boxscore files across any dumpsN layouts
+    def _boxscore_candidates(game_id: str) -> List[str]:
+        pats = [
+            os.path.join("artifacts", "dumps*", "raw", "boxscore", f"{game_id}.json"),
+            os.path.join("artifacts", "dumps_rawonly", "raw", f"boxscore_{game_id}.json"),
+        ]
+        paths: List[str] = []
+        for pat in pats:
+            try:
+                for p in glob.glob(pat):
+                    if os.path.exists(p):
+                        paths.append(p)
+            except Exception:
+                pass
+        # add explicit known locations for precedence/back-compat
+        for p in (
+            os.path.join("artifacts", "dumps",  "raw", "boxscore", f"{game_id}.json"),
+            os.path.join("artifacts", "dumps2", "raw", "boxscore", f"{game_id}.json"),
+        ):
+            if os.path.exists(p):
+                paths.append(p)
+        # also try next to the input pbp file, e.g. API/Final/<year>/raw/boxscore/<gamePk>.json
+        try:
+            in_dir = os.path.abspath(os.path.dirname(args.in_path))
+            raw_dir = os.path.dirname(in_dir)
+            local_box = os.path.join(raw_dir, "boxscore", f"{game_id}.json")
+            if os.path.exists(local_box):
+                paths.append(local_box)
+            local_alt = os.path.join(raw_dir, f"boxscore_{game_id}.json")
+            if os.path.exists(local_alt):
+                paths.append(local_alt)
+        except Exception:
+            pass
+        # de-dup in order
+        seen = set(); uniq: List[str] = []
+        for p in paths:
+            if p not in seen:
+                seen.add(p); uniq.append(p)
+        return uniq
 
     ensure_dir(args.out_dir)
+    data = load_json(args.in_path)
+    gamePk = data.get("gamePk") or "unknown"
+    evts   = data.get("events") or []
+    if not evts:
+        raise SystemExit("No events in input.")
 
-    pbp_onice = load_json(args.in_path)
-    game = parse_game(pbp_onice)
+    root_home = data.get("home_team_id")
+    root_away = data.get("away_team_id")
+    home_id = args.home_team_id or root_home
+    away_id = args.away_team_id or root_away
 
-    # Prefer raw boxscore/shiftcharts metadata for rink + player meta (truly from raws).
-    raw_dir = _infer_raw_dir_from_pbpice_path(str(args.in_path))
-    raw_rinkid, raw_season, raw_date, raw_name_map, raw_pos_map = load_raw_boxscore_and_shiftcharts_meta(raw_dir, int(game.gamePk))
-    team_meta = load_raw_boxscore_team_meta(raw_dir, int(game.gamePk))
-
-    # season/date stamps: prefer CLI; else raw boxscore/pbp (if available); else keep blank.
-    season_stamp = str(args.season or "").strip() or str(raw_season or "").strip()
-    date_stamp = str(args.date or "").strip() or str(raw_date or "").strip()
-    game_date_obj = _parse_yyyy_mm_dd(date_stamp)
-
-    # rinkid: prefer CLI; else raw arena name; else home team abbrev as deterministic stamp.
-    rinkid = str(args.rinkid or "").strip() or str(raw_rinkid or "").strip()
-    if not rinkid:
-        try:
-            rinkid = str((pbp_onice.get("home", {}) or {}).get("abbrev") or game.home_team_id)
-                        except Exception:
-            rinkid = str(game.home_team_id)
-
-    # Player meta maps: prefer raw; fall back to artifact CSV if provided.
-    player_name_map = dict(raw_name_map or {})
-    player_pos_map = dict(raw_pos_map or {})
-    meta_path = str(args.player_meta_csv or "").strip()
-    csv_hand_map: Dict[int, str] = {}
-    if meta_path:
-        csv_name_map, csv_pos_map = load_player_meta_csv(meta_path)
-        csv_hand_map = load_player_handedness_csv(meta_path)
-        for k, v in (csv_name_map or {}).items():
-            player_name_map.setdefault(int(k), v)
-        for k, v in (csv_pos_map or {}).items():
-            player_pos_map.setdefault(int(k), v)
-
-    (
-        team_onice_by_sec,
-        goalie_ids_by_sec,
-        events_by_sec,
-        orders_by_sec,
-        sso_by_sec,
-        shift_changes_by_sec,
-        end_event_at,
-        fo_meta,
-        tv_timeout_secs,
-        horizon,
-    ) = build_second_index(game)
-
-    credit_by_sec, cum_home_goals, cum_away_goals = build_credit_by_sec(
-        game, team_onice_by_sec, goalie_ids_by_sec, events_by_sec, orders_by_sec, shift_changes_by_sec
-    )
-
-    windows = build_windows(
-        game=game,
-        team_onice_by_sec=team_onice_by_sec,
-        goalie_ids_by_sec=goalie_ids_by_sec,
-        events_by_sec=events_by_sec,
-        orders_by_sec=orders_by_sec,
-        sso_by_sec=sso_by_sec,
-        shift_changes_by_sec=shift_changes_by_sec,
-        end_event_at=end_event_at,
-        fo_meta=fo_meta,
-        tv_timeout_secs=tv_timeout_secs,
-        horizon=horizon,
-        hard_cap_sec=int(args.hard_cap_sec),
-    )
-
-    out_windows_csv = ""
-    if args.write_windows:
-        # windows CSV (containers; optional)
-        windows_rows = []
-        for w in windows:
-            windows_rows.append(
-                {
-                    "season": args.season,
-                    "date": args.date,
-                    "gamePk": int(game.gamePk),
-                    "rinkid": args.rinkid,
-                    **w,
-                }
-            )
-        windows_cols = [
-            "season","date","gamePk","rinkid",
-            "window_id","period","start_sec","end_sec","duration","clock_start",
-            "strength_global","home_goalie_present","away_goalie_present","home_goalie_pulled","away_goalie_pulled",
-            "fo_zone","fo_won_team_id","fo_won_player_id","fo_lost_player_id",
-            "start_prev_break_type","start_prev_break_team_id","start_prev_break_subtype","media_timeout_start",
-            "end_event_type","home_ids_start","away_ids_start","home_ids_end","away_ids_end",
-        ]
-        extra_w = sorted({k for r in windows_rows for k in r.keys() if k not in windows_cols})
-        out_windows_csv = os.path.join(args.out_dir, f"windows_{game.gamePk}.csv")
-        write_csv(out_windows_csv, windows_rows, windows_cols + extra_w)
-
-    # tokens CSV
-    token_rows = generate_tokens_and_rows(
-        game=game,
-        windows=windows,
-        team_onice_by_sec=team_onice_by_sec,
-        goalie_ids_by_sec=goalie_ids_by_sec,
-        events_by_sec=events_by_sec,
-        orders_by_sec=orders_by_sec,
-        sso_by_sec=sso_by_sec,
-        shift_changes_by_sec=shift_changes_by_sec,
-        fo_meta=fo_meta,
-        end_event_at=end_event_at,
-        credit_by_sec=credit_by_sec,
-        cum_home_goals=cum_home_goals,
-        cum_away_goals=cum_away_goals,
-        horizon_sec=int(args.horizon_sec),
-        min_swap=int(args.min_swap),
-        min_gap_sec=int(args.min_gap_sec),
-        stable_sec=int(args.stable_sec),
-        matchup_stable_sec=int(args.matchup_stable_sec),
-        rc_require_stable=int(args.rc_require_stable),
-        post_dwell_sec=int(args.post_dwell_sec),
-        mass_swap_suppress_threshold=int(args.mass_swap_suppress_threshold),
-        max_tokens=int(args.max_tokens),
-        opp_change_tokens=int(args.opp_change_tokens),
-        opp_cover_gap_sec=int(args.opp_cover_gap_sec),
-        mode=str(args.mode),
-        player_name_map=player_name_map,
-        player_pos_map=player_pos_map,
-        season=season_stamp,
-        date=date_stamp,
-        rinkid=rinkid,
-        min_exposure_sec=int(args.min_exposure_sec),
-        state_stable_sec=int(args.state_stable_sec),
-        state_chunk_by_h=int(args.state_chunk_by_h),
-    )
-
-    # --- Enrichment: handedness, age, and team names (for Parquet + easier modeling) ---
-    cache_dir = str(args.player_landing_cache_dir or "").strip() or "artifacts/cache/player_landing"
-    fetch_landing = int(args.fetch_player_landing) != 0
-
-    # Team identity (from raw boxscore; best-effort)
-    home_abbrev = str(team_meta.get("homeAbbrev") or (pbp_onice.get("home", {}) or {}).get("abbrev") or "").strip()
-    away_abbrev = str(team_meta.get("awayAbbrev") or (pbp_onice.get("away", {}) or {}).get("abbrev") or "").strip()
-    home_name = str(team_meta.get("homeName") or "").strip()
-    away_name = str(team_meta.get("awayName") or "").strip()
-    home_tid = _safe_int(team_meta.get("homeTeamId"), int(game.home_team_id))
-    away_tid = _safe_int(team_meta.get("awayTeamId"), int(game.away_team_id))
-
-    landing_cache: Dict[int, Dict[str, Any]] = {}
-    for r in token_rows:
-        pid = int(r.get("playerId", 0) or 0)
-        side = str(r.get("team_side") or "")
-
-        # team names next to player fields
-        if side == "home":
-            r["teamAbbrev"] = home_abbrev
-            r["teamName"] = home_name
-            r["oppTeamId"] = int(away_tid)
-            r["oppTeamAbbrev"] = away_abbrev
-            r["oppTeamName"] = away_name
-        else:
-            r["teamAbbrev"] = away_abbrev
-            r["teamName"] = away_name
-            r["oppTeamId"] = int(home_tid)
-            r["oppTeamAbbrev"] = home_abbrev
-            r["oppTeamName"] = home_name
-
-        # handedness + birthDate from meta csv first; else api-web player landing (cached on disk).
-        hand = str((csv_hand_map.get(pid) or "")).strip()
-        birth_date_obj: Optional[datetime.date] = None
-        if (not hand or game_date_obj is not None) and pid > 0:
-            if pid not in landing_cache:
-                landing_cache[pid] = get_player_landing_cached(pid, cache_dir, allow_fetch=fetch_landing)
-            land = landing_cache.get(pid) or {}
-            if not hand:
-                hand = str(land.get("shootsCatches") or land.get("shoots_catches") or land.get("handedness") or "").strip()
-            bd = str(land.get("birthDate") or land.get("birthdate") or land.get("birth_date") or "").strip()
-            birth_date_obj = _parse_yyyy_mm_dd(bd)
-        r["handedness"] = hand
-
-        age = compute_age_years(birth_date_obj, game_date_obj) if game_date_obj is not None else None
-        r["age"] = int(age) if age is not None else ""
-
-    def _dedupe_train_sim_identical_columns(rows: List[Dict[str, Any]]) -> List[str]:
-        """
-        If mode=both and train_* columns are identical to sim_* columns for all rows,
-        drop the redundant train_* columns.
-        Returns the list of dropped column names.
-        """
-        if not rows:
-            return []
-        keys: set = set()
-        for r in rows:
-            keys.update(r.keys())
-        sim_bases = {k[4:] for k in keys if k.startswith("sim_")}
-        train_bases = {k[6:] for k in keys if k.startswith("train_")}
-        common = sorted(sim_bases & train_bases)
-        dropped: List[str] = []
-        for base in common:
-            sk = f"sim_{base}"
-            tk = f"train_{base}"
-            same = True
-            for r in rows:
-                if r.get(sk) != r.get(tk):
-                    same = False
+    # Fallback: resolve team IDs from boxscore when missing
+    if (home_id is None or away_id is None) and gamePk:
+        for rel in _boxscore_candidates(str(gamePk)):
+            if os.path.exists(rel):
+                try:
+                    box_try = load_json(rel)
+                    h_obj = (box_try.get("homeTeam") or box_try.get("home") or {})
+                    a_obj = (box_try.get("awayTeam") or box_try.get("away") or {})
+                    hid = h_obj.get("id") or (h_obj.get("team") or {}).get("id")
+                    aid = a_obj.get("id") or (a_obj.get("team") or {}).get("id")
+                    if hid is not None and home_id is None:
+                        home_id = int(hid)
+                    if aid is not None and away_id is None:
+                        away_id = int(aid)
                     break
-            if same:
-                dropped.append(tk)
-        if dropped:
-            for r in rows:
-                for k in dropped:
-                    if k in r:
-                        del r[k]
-        return dropped
+                except Exception:
+                    pass
+    if args.debug_standings:
+        print({"debug":"standings","cli_team_ids": {"home_team_id": home_id, "away_team_id": away_id}})
 
-    # Canonical, auditable column ordering:
-    # Who/Where → Window context → Token semantics → Token timing/state → Segment debug → PRE roster/entities
-    # → instruments/constraints → exposure/offsets → outcomes → exit/replacement supervision.
-    tok_cols_core = [
-        # 1) Identity / grouping (never model inputs)
-        "season","date","rinkid","gamePk",
-        "teamId","team_side","teamAbbrev","teamName","oppTeamId","oppTeamAbbrev","oppTeamName",
-        "playerId","playerName","positionCode","handedness","age",
-        "window_id","strength_global","token_idx","t_token",
+    name_map: Optional[Dict[int, str]] = None
+    pos_map: Optional[Dict[int, str]] = None
+    def _extract_name_map(obj: Any) -> Optional[Dict[int, str]]:
+        try:
+            if isinstance(obj, dict) and "playerByGameStats" in obj:
+                out: Dict[int, str] = {}
+                pgs = obj.get("playerByGameStats") or {}
+                for side in ("homeTeam", "awayTeam"):
+                    side_obj = pgs.get(side) or {}
+                    for group in ("forwards", "defense", "goalies"):
+                        for p in side_obj.get(group) or []:
+                            try:
+                                pid = int(p.get("playerId")) if p.get("playerId") is not None else None
+                            except Exception:
+                                pid = None
+                            if pid is None:
+                                continue
+                            nm = p.get("name")
+                            name = None
+                            if isinstance(nm, dict):
+                                name = nm.get("default") or nm.get("fullName") or nm.get("lastFirstName")
+                            elif isinstance(nm, str):
+                                name = nm
+                            if not name:
+                                name = p.get("fullName") or p.get("playerName")
+                            if name:
+                                out[pid] = str(name)
+                return out or None
+            if isinstance(obj, dict):
+                if "players" in obj and isinstance(obj["players"], list):
+                    return _extract_name_map(obj["players"]) or {}
+                if all(isinstance(k, (str,int)) for k in obj.keys()):
+                    out = {}
+                    for k, v in obj.items():
+                        try:
+                            pid = int(k); name = str(v)
+                            out[pid] = name
+                        except Exception:
+                            continue
+                    return out
+            if isinstance(obj, list):
+                out = {}
+                for p in obj:
+                    if not isinstance(p, dict): continue
+                    pid = p.get("playerId") or p.get("id") or p.get("player_id")
+                    if pid is None: continue
+                    try: pid = int(pid)
+                    except Exception: continue
+                    name = (
+                        p.get("fullName")
+                        or p.get("name")
+                        or (p.get("firstName") and p.get("lastName") and f"{p.get('firstName')} {p.get('lastName')}")
+                        or None
+                    )
+                    if name is None:
+                        fn = p.get("firstName") or (isinstance(p.get("firstName"), dict) and p.get("firstName").get("default"))
+                        ln = p.get("lastName") or (isinstance(p.get("lastName"), dict) and p.get("lastName").get("default"))
+                        if fn or ln:
+                            name = f"{fn or ''} {ln or ''}".strip()
+                    if name: out[pid] = str(name)
+                return out
+        except Exception:
+            return None
+        return None
 
-        # 2) Token semantics + timing
-        "token_type","seg_idx",
-        "is_outcome_token","is_selection_token","is_hazard_token",
-        "run_id","run_start","run_end","run_duration","state_changed_reason","state_persist_sec",
-        "t_context","t_end","seconds_token","seconds_onice_in_h",
+    def _extract_pos_map(obj: Any) -> Optional[Dict[int, str]]:
+        try:
+            # raw PBP style: { players: [ { playerId, positionCode, teamId, ... } ] }
+            if isinstance(obj, dict) and isinstance(obj.get("players"), list):
+                out: Dict[int, str] = {}
+                for p in obj["players"]:
+                    if not isinstance(p, dict):
+                        continue
+                    pid = p.get("playerId") or p.get("id") or p.get("player_id")
+                    pos = p.get("positionCode") or p.get("pos") or p.get("position")
+                    if pid is None or pos is None:
+                        continue
+                    try:
+                        pid = int(pid)
+                    except Exception:
+                        continue
+                    out[pid] = str(pos if not isinstance(pos, dict) else pos.get("code"))
+                return out or None
+            # list of player dicts
+            if isinstance(obj, list):
+                out: Dict[int, str] = {}
+                for p in obj:
+                    if not isinstance(p, dict):
+                        continue
+                    pid = p.get("playerId") or p.get("id") or p.get("player_id")
+                    pos = p.get("positionCode") or p.get("pos") or p.get("position")
+                    if pid is None or pos is None:
+                        continue
+                    try:
+                        pid = int(pid)
+                    except Exception:
+                        continue
+                    out[pid] = str(pos if not isinstance(pos, dict) else pos.get("code"))
+                return out or None
+            # boxscore style: playerByGameStats
+            if isinstance(obj, dict) and "playerByGameStats" in obj:
+                out: Dict[int, str] = {}
+                pgs = obj.get("playerByGameStats") or {}
+                for side in ("homeTeam","awayTeam"):
+                    for group in ("forwards","defense","goalies"):
+                        for p in (pgs.get(side) or {}).get(group) or []:
+                            try:
+                                pid = int(p.get("playerId")) if p.get("playerId") is not None else None
+                            except Exception:
+                                pid = None
+                            if pid is None:
+                                continue
+                            # handle position as code string or nested code
+                            pos_raw = p.get("positionCode") or p.get("pos") or p.get("position")
+                            if isinstance(pos_raw, dict):
+                                pos = pos_raw.get("code")
+                            else:
+                                pos = pos_raw
+                            if pos:
+                                out[pid] = str(pos)
+                return out or None
+        except Exception:
+            return None
+        return None
 
-        # 3) Container/window context (stable within window; decision-time instruments)
-        "win_start_sec",
-        "win_fo_zone","win_fo_won_team_id",
-        "win_start_prev_break_type","win_start_prev_break_team_id","win_start_prev_break_subtype",
-        "win_home_last_change_opportunity","win_media_timeout_start",
-        "win_home_goalie_pulled","win_away_goalie_pulled",
-        "tok_last_fo_zone","is_boundary_second",
+    if args.players_json and os.path.exists(args.players_json):
+        try:
+            name_src = load_json(args.players_json)
+            name_map = _extract_name_map(name_src)
+        except Exception:
+            name_map = None
+    # If not provided or failed, try explicit boxscore
+    if not name_map and args.boxscore_json and os.path.exists(args.boxscore_json):
+        try:
+            name_src = load_json(args.boxscore_json)
+            name_map = _extract_name_map(name_src)
+        except Exception:
+            name_map = None
+    if not name_map:
+        # try embedded (best-effort)
+        name_map = _extract_name_map(data.get("players") or {}) or None
+    if not name_map and gamePk:
+        # heuristic defaults across any dumps*
+        for rel in _boxscore_candidates(str(gamePk)):
+            if os.path.exists(rel):
+                try:
+                    name_src = load_json(rel)
+                    name_map = _extract_name_map(name_src)
+                except Exception:
+                    name_map = None
+                if name_map:
+                    break
 
-        # 4) PRE roster & entities (CIN core; fixed slots only)
-        "num_team_skaters","num_opp_skaters",
-        "team_slot1","team_slot2","team_slot3","team_slot4","team_slot5","team_slot6",
-        "opp_slot1","opp_slot2","opp_slot3","opp_slot4","opp_slot5","opp_slot6",
-        "own_goalie_id","opp_goalie_id",
+    # Position map: use boxscore only (explicit arg or auto from artifacts/dumps/raw/boxscore/<gamePk>.json)
+    if args.boxscore_json and os.path.exists(args.boxscore_json):
+        try:
+            pos_src = load_json(args.boxscore_json)
+            pos_map = _extract_pos_map(pos_src)
+        except Exception:
+            pos_map = None
+    if not pos_map and gamePk:
+        for rel in _boxscore_candidates(str(gamePk)):
+            if os.path.exists(rel):
+                try:
+                    pos_src = load_json(rel)
+                    pos_map = _extract_pos_map(pos_src)
+                except Exception:
+                    pos_map = None
+                if pos_map:
+                    break
 
-        # 5) Decision-time constraints
-        "bench_rest_bucket","bench_size_at_t","entry_after_faceoff_flag",
+    # Final fallback: extract positions from the pbp_onice payload if available
+    if not pos_map:
+        try:
+            pos_map = _extract_pos_map(data.get("players") or {}) or None
+        except Exception:
+            pos_map = None
 
-        # 6) Exposure & offsets
-        "offset_log_toi",
+    # try to derive numeric game_pk for standings matching
+    game_pk_int: Optional[int] = None
+    try:
+        if isinstance(data.get("gamePk"), int):
+            game_pk_int = int(data.get("gamePk"))
+        else:
+            m = re.search(r"(\d{10})", os.path.basename(args.in_path))
+            if m:
+                game_pk_int = int(m.group(1))
+    except Exception:
+        game_pk_int = None
 
-        # 7) Targets (what happened next)
+    windows, team_rows, player_rows = build_windows(
+        evts,
+        hard_cap_sec=args.hard_cap_sec,
+        home_team_id=home_id,
+        away_team_id=away_id,
+        player_name_map=name_map,
+        player_pos_map=pos_map,
+        debug_ga=args.debug_ga,
+        debug_standings=args.debug_standings,
+        game_pk=game_pk_int,
+    )
+
+    # Resolve game date from boxscore
+    boxscore_date = None
+    boxscore_rinkid = None
+    if gamePk:
+        for rel in _boxscore_candidates(str(gamePk)):
+            if os.path.exists(rel):
+                try:
+                    j = load_json(rel)
+                    cand = j.get("gameDate") or j.get("date") or j.get("game_date")
+                    if not cand:
+                        gd = j.get("gameData") or {}
+                        dt = gd.get("datetime") or {}
+                        cand = dt.get("dateTime")
+                    if isinstance(cand, str) and len(cand) >= 10:
+                        boxscore_date = cand[:10]
+                    # rink id/name
+                    venue_obj = j.get("venue") if isinstance(j.get("venue"), dict) else None
+                    if venue_obj is not None:
+                        rink_cand = venue_obj.get("id") or venue_obj.get("default") or venue_obj.get("name")
+                    else:
+                        rink_cand = None
+                    if not rink_cand:
+                        gd = j.get("gameData") or {}
+                        v2 = gd.get("venue") if isinstance(gd.get("venue"), dict) else {}
+                        rink_cand = v2.get("id") or v2.get("name")
+                    if not rink_cand:
+                        gi = j.get("gameInfo") or {}
+                        v3 = gi.get("venue") if isinstance(gi.get("venue"), dict) else {}
+                        rink_cand = v3.get("id") or v3.get("name")
+                    if rink_cand is not None:
+                        try:
+                            boxscore_rinkid = int(rink_cand)
+                        except Exception:
+                            boxscore_rinkid = str(rink_cand)
+                except Exception:
+                    pass
+                # We found a boxscore file; stop after first found
+                break
+
+    # Stamp gameid/teamid/date/rinkid into JSON outputs (without mutating originals)
+    windows_json = [dict(r, gameid=gamePk, teamid=None, date=boxscore_date, rinkid=boxscore_rinkid) for r in windows]
+    team_rows_json = []
+    for r in team_rows:
+        side = r.get("team_side")
+        tid = (home_id if side == "home" else (away_id if side == "away" else None))
+        team_rows_json.append(dict(r, gameid=gamePk, teamid=tid, date=boxscore_date, rinkid=boxscore_rinkid))
+    player_rows_json = []
+    for r in player_rows:
+        side = r.get("team_side")
+        tid = (home_id if side == "home" else (away_id if side == "away" else None))
+        player_rows_json.append(dict(r, gameid=gamePk, teamid=tid, date=boxscore_date, rinkid=boxscore_rinkid))
+
+    # JSON outputs (skip if user only wants player_train CSVs)
+    if not getattr(args, "csv_only_player_train", False):
+        jw = os.path.join(args.out_dir, f"windows_{gamePk}.json")
+        jt = os.path.join(args.out_dir, f"team_windows_{gamePk}.json")
+        jp = os.path.join(args.out_dir, f"player_windows_{gamePk}.json")
+        write_json_pretty(windows_json, jw)
+        write_json_pretty(team_rows_json, jt)
+        write_json_pretty(player_rows_json, jp)
+        print(f"Wrote {jw} ({len(windows)} windows)")
+        print(f"Wrote {jt} ({len(team_rows)} team-rows; {len(team_rows)//2} windows × 2 teams minus EA prunes)")
+        print(f"Wrote {jp} ({len(player_rows)} player-rows)")
+
+    if args.csv:
+        # Stamp gameid/teamid/date/rinkid for CSV outputs
+        windows_csv_rows = [dict(r, gameid=gamePk, teamid=None, date=boxscore_date, rinkid=boxscore_rinkid) for r in windows]
+        team_rows_csv_rows = []
+        for r in team_rows:
+            side = r.get("team_side")
+            tid = (home_id if side == "home" else (away_id if side == "away" else None))
+            team_rows_csv_rows.append(dict(r, gameid=gamePk, teamid=tid, date=boxscore_date, rinkid=boxscore_rinkid))
+        player_rows_csv_rows = []
+        for r in player_rows:
+            side = r.get("team_side")
+            tid = (home_id if side == "home" else (away_id if side == "away" else None))
+            player_rows_csv_rows.append(dict(r, gameid=gamePk, teamid=tid, date=boxscore_date, rinkid=boxscore_rinkid))
+        if not args.csv_only_player_train:
+            write_csv(
+            os.path.join(args.out_dir, f"windows_{gamePk}.csv"),
+            windows_csv_rows,
+            ["window_id","period","start_sec","end_sec","duration","clock_start",
+             "strength_global","fo_zone","fo_won_team_id","end_event_type","delayed_penalty",
+             "home_ids_start","away_ids_start","home_ids_end","away_ids_end","gameid","teamid","date","rinkid"]
+        )
+        write_csv(
+            os.path.join(args.out_dir, f"team_windows_{gamePk}.csv"),
+            team_rows_csv_rows,
+            ["window_id","team_side","period","start_sec","end_sec","duration","clock_start",
+                        "end_event_type","strength_global","strength_team","strength_team_label",
+             "skaters_for","skaters_against","goalie_for","goalie_against",
+                        "fo_zone","zone_start","fo_won_team_id","start_prev_break_type","start_prev_break_subtype","media_timeout_start","after_icing","after_icing_by_team","after_icing_by_opponent","home_away","long_change",
+             "score_diff_start","clock_s",
+             "pulled_goalie_start","goalie_pulled_since",
+             "fo_seen_start","fo_won_start","fo_lost_start","home_last_change_opportunity",
+             "rest_days_team","b2b_team",
+             "standing_prior",
+             "team_ids_start","opp_ids_start","team_ids_end","opp_ids_end","gameid","teamid","date","rinkid"]
+        )
+        write_csv(
+            os.path.join(args.out_dir, f"player_windows_{gamePk}.csv"),
+            player_rows_csv_rows,
+                    [
+                        "window_id","team_side","period","start_sec","end_sec","duration","clock_start",
+                        "end_event_type","strength_global","fo_zone","zone_start","start_prev_break_type","start_prev_break_subtype","media_timeout_start","delayed_penalty","after_icing","after_icing_by_team","after_icing_by_opponent","home_away","long_change","playerId","positionCode","position","playerName",
+             "seconds","pp_seconds","pk_seconds","pp_share","pk_share","offset_log_toi","offset_log_pp","offset_log_pk",
+                        "us_skaters_start","them_skaters_start","opponent_goalie_id_start",
+             "onice_elapsed_at_window_start","shift_count_in_window",
+                        "last_shift_len_s","time_since_last_shift_s","last_shift_len_missing","time_since_last_shift_missing",
+                        "entered_after_start","entry_offset_s","exited_before_end","exit_offset_s",
+                        "stint_duration_max","stint_duration_st",
+             "score_diff_start","score_state_start","clock_s",
+             "matchup_quality_pct",
+                        "fo_seen_start","fo_team_won_start","fo_team_lost_start","fo_won_start","fo_lost_start","fo_took_start","fo_took_won_start","fo_took_lost_start","home_last_change_opportunity",
+             "rest_days_team","b2b_team",
+             "standing_prior",
+             "xGF","xGA","GF","GA","SF","SA","AF","AA","BF","BA",
+             "tsf_0_5","tsf_6_20","tsf_21_60","tsf_61p",
+             "elapsed_share_0_5","elapsed_share_6_20","elapsed_share_21_60","elapsed_share_61p",
+                        "early_mass",
+                        "ai_OZ_start","ai_DZ_start","fo_O_start","fo_D_start","last_change_start","long_change_start",
+             "teammates_onice_ids_start","opponents_onice_ids_start",
+             "teammates_onice_ids_w","teammates_onice_w","teammates_onice_sec_w",
+             "opponents_onice_ids_w","opponents_onice_w","opponents_onice_sec_w",
+             "with_event_GF","with_event_GA","with_event_SF","with_event_SA",
+                        "giveaways_committed","takeaways_forced","hits_personal","blocks_personal",
+                        "gameid","teamid","date","rinkid"]
+                    )
+        # Also write a train-filtered player windows CSV with only PP/PK/5v5
+        player_rows_train_csv_rows = [
+            r for r in player_rows_csv_rows
+            if str(r.get("strength_global")) in {"5v5","PP","PK"}
+            and (int(r.get("period", 0)) in (1, 2, 3))
+        ]
+        # Canonicalize keys in output header: use gamePk/teamId only
+        for _r in player_rows_train_csv_rows:
+            if "gamePk" not in _r and "gameid" in _r:
+                _r["gamePk"] = _r.get("gameid")
+            if "teamId" not in _r and "teamid" in _r:
+                _r["teamId"] = _r.get("teamid")
+            _r.pop("gameid", None)
+            _r.pop("teamid", None)
+        write_csv(
+            os.path.join(args.out_dir, f"player_windows_train_{gamePk}.csv"),
+            player_rows_train_csv_rows,
+            ["window_id","team_side","period","start_sec","end_sec","duration","clock_start",
+            "end_event_type","strength_global","fo_zone","zone_start","start_prev_break_type","start_prev_break_subtype","media_timeout_start","after_icing","after_icing_by_team","after_icing_by_opponent","home_away","long_change","playerId","positionCode","position","playerName",
+            "seconds","pp_seconds","pk_seconds","pp_share","pk_share","offset_log_toi","offset_log_pp","offset_log_pk",
+            "us_skaters_start","them_skaters_start","opponent_goalie_id_start",
+            "onice_elapsed_at_window_start","shift_count_in_window","last_shift_len_s","time_since_last_shift_s","last_shift_len_missing","time_since_last_shift_missing",
+            "entered_after_start","entry_offset_s","exited_before_end","exit_offset_s",
+            "stint_duration_max","stint_duration_st",
+             "score_diff_start","score_state_start","clock_s",
+             "matchup_quality_pct",
+             "fo_seen_start","fo_team_won_start","fo_team_lost_start","fo_won_start","fo_lost_start","fo_took_start","fo_took_won_start","fo_took_lost_start","home_last_change_opportunity",
+             "rest_days_team","b2b_team",
+             "standing_prior",
+             "xGF","xGA","GF","GA","SF","SA","AF","AA","BF","BA",
+             "tsf_0_5","tsf_6_20","tsf_21_60","tsf_61p",
+             "elapsed_share_0_5","elapsed_share_6_20","elapsed_share_21_60","elapsed_share_61p",
+             "early_mass",
+             "ai_OZ_start","ai_DZ_start","fo_O_start","fo_D_start","last_change_start","long_change_start",
+             "teammates_onice_ids_start","opponents_onice_ids_start",
+             "teammates_onice_ids_w","teammates_onice_w","teammates_onice_sec_w",
+             "opponents_onice_ids_w","opponents_onice_w","opponents_onice_sec_w",
+             "with_event_GF","with_event_GA","with_event_SF","with_event_SA",
+             "giveaways_committed","takeaways_forced","hits_personal","blocks_personal",
+             "gamePk","teamId","date","rinkid"]
+        )
+
+        # Player rollup: re-read the finalized train CSV from disk, and project exact columns
+        train_csv_path = os.path.join(args.out_dir, f"player_windows_train_{gamePk}.csv")
+        import pandas as _pd
+        df_train = _pd.read_csv(train_csv_path)
+        # Derive season from date column
+        def _season_from_date(df):
+            try:
+                dt = _pd.to_datetime(df["date"].iloc[0], errors="coerce")
+                if _pd.notna(dt):
+                    y = int(dt.year if dt.month >= 7 else dt.year - 1)
+                    return f"{y}{y+1}"
+            except Exception:
+                pass
+            try:
+                y = int(str(gamePk)[:4])
+                return f"{y}{y+1}"
+            except Exception:
+                return ""
+        season_str = _season_from_date(df_train)
+        df_train["season"] = season_str
+        # Canonicalize keys (gamePk/teamId); then select requested columns
+        if "gamePk" not in df_train.columns and "gameid" in df_train.columns:
+            df_train["gamePk"] = df_train["gameid"]
+        if "teamId" not in df_train.columns and "teamid" in df_train.columns:
+            df_train["teamId"] = df_train["teamid"]
+        wanted_cols = [
+            # A) Identity / keys
+            "season","date","gamePk","teamId","playerId","positionCode","position","team_side","window_id",
+            # B) Window timing
+            "start_sec","end_sec","seconds","period",
+            # C) Strength & skater counts
+            "pp_seconds","pk_seconds","us_skaters_start","them_skaters_start","strength_global",
+            # D) Events/numerators
             "xGF","xGA","GF","GA","SF","SA","AF","AA","BF","BA",
-            "giveaways_committed","takeaways_forced","hits_personal","blocks_personal","shots_blocked_personal",
-            "giveaways_committed_oz","giveaways_committed_nz","giveaways_committed_dz",
-            "takeaways_forced_oz","takeaways_forced_nz","takeaways_forced_dz",
-            "hits_personal_oz","hits_personal_nz","hits_personal_dz",
-            "blocks_personal_oz","blocks_personal_nz","blocks_personal_dz",
-            "shots_blocked_personal_oz","shots_blocked_personal_nz","shots_blocked_personal_dz",
+            # E) EV deployment markers
+            "zone_start", "tsf_0_5","tsf_6_20","tsf_21_60","tsf_61p","last_change_start","long_change_start","early_mass",
+            # F) Co-presence / chemistry payload
+            "teammates_onice_ids_w","teammates_onice_sec_w","teammates_onice_w",
+            "opponents_onice_ids_w","opponents_onice_sec_w","opponents_onice_w",
+            # G) Faceoff flags at window start
+            "fo_seen_start","fo_team_won_start","fo_team_lost_start","fo_took_start","fo_took_won_start","fo_took_lost_start",
+            # H) Bench / shift history
+            "last_shift_len_s","time_since_last_shift_s","entry_offset_s","exited_before_end","exit_offset_s",
+            # I) Micro events
+            "giveaways_committed","takeaways_forced","hits_personal","blocks_personal",
+        ]
+        # Ensure all wanted columns exist; backfill missing with zeros (numeric) or empty lists as appropriate
+        for c in wanted_cols:
+            if c not in df_train.columns:
+                # Faceoff flags and counts default to 0
+                df_train[c] = 0
+        cols_present = [c for c in wanted_cols if c in df_train.columns]
+        player_rollup_rows = df_train[cols_present].to_dict(orient="records")
 
-        # 8) Exit / replacement supervision
-        "exit_event_within_h","exit_time_to_exit_s","exit_reason_proxy",
-        "replacement_count","replacement1_id","replacement2_id",
-    ]
-
-    schema = str(args.schema or "slim").lower().strip()
-    sim_cols = [
-        # Slim, sim-safe context
-        "sim_period","sim_clock_s",
-        "sim_strength_team","sim_score_diff","sim_long_change","sim_home_away",
-        "sim_last_event_type","sim_time_since_last_event_s","sim_last_event_zone","sim_last_event_owner_team_id",
-        "sim_shift_elapsed_s",
-        "sim_exit_reason_proxy_pre","sim_exit_reason_conf_pre",
-        "sim_change_reason_proxy_pre","sim_change_reason_conf_pre",
-    ]
-    if schema == "full":
-        sim_cols.extend(
+        write_csv(
+            os.path.join(args.out_dir, f"player_rollup_{gamePk}.csv"),
+            player_rollup_rows,
             [
-                # more detailed diagnostics
-                "sim_last_event_sec","sim_last_event_lookback_s",
-                "sim_shift_prev_n","sim_shift_prev_mean_len_s","sim_shift_prev_sd_len_s",
-                "sim_reason_is_special_teams","sim_reason_is_after_faceoff","sim_reason_is_after_stoppage","sim_reason_is_after_icing","sim_reason_is_after_goal","sim_reason_is_after_penalty",
-                "sim_reason_is_period_boundary","sim_reason_own_goalie_pulled","sim_reason_opp_goalie_pulled","sim_reason_own_goalie_pull_transition","sim_reason_opp_goalie_pull_transition","sim_reason_boundary_prev_break_type",
-                "sim_reason_zone_O","sim_reason_zone_D","sim_reason_zone_N","sim_reason_score_big","sim_reason_fatigue_z","sim_reason_shift_elapsed_s","sim_reason_shift_mean_s",
+                # A) Identity / keys
+                "season","date","gameid","teamid","playerId","positionCode","position","team_side","window_id",
+                # B) Window timing
+                "start_sec","end_sec","seconds","period",
+                # C) Strength & skater counts
+                "pp_seconds","pk_seconds","us_skaters_start","them_skaters_start","strength_global",
+                # D) Events/numerators
+                "xGF","xGA","GF","GA","SF","SA","AF","AA","BF","BA",
+                # E) EV deployment markers
+                "zone_start",
+                # F) Co-presence / chemistry payload
+                "teammates_onice_ids_w","teammates_onice_sec_w","teammates_onice_w",
+                "opponents_onice_ids_w","opponents_onice_sec_w","opponents_onice_w",
+                # G) Faceoff flags at window start
+                "fo_seen_start","fo_team_won_start","fo_team_lost_start","fo_took_start","fo_took_won_start","fo_took_lost_start",
+                # H) Bench / shift history
+                "last_shift_len_s","time_since_last_shift_s","entry_offset_s","exited_before_end","exit_offset_s",
+                # I) Micro events
+                "giveaways_committed","takeaways_forced","hits_personal","blocks_personal",
             ]
         )
-    train_cols = [
-        "train_last_shift_len_s","train_time_since_last_shift_s","train_entry_offset_s",
-    ]
 
-    # Insert sim/train blocks right after exposure fields (keep timing/exposure together).
-    insert_at = tok_cols_core.index("seconds_onice_in_h") + 1
-    mode = str(args.mode).lower()
-    cols_mode_block: List[str] = []
-    if mode in ("sim", "both"):
-        cols_mode_block.extend(sim_cols)
-    if mode in ("train", "both"):
-        cols_mode_block.extend(train_cols)
-    tok_cols_core = tok_cols_core[:insert_at] + cols_mode_block + tok_cols_core[insert_at:]
-
-    dropped_train: List[str] = []
-    if mode == "both":
-        dropped_train = _dedupe_train_sim_identical_columns(token_rows)
-        if dropped_train:
-            tok_cols_core = [c for c in tok_cols_core if c not in set(dropped_train)]
-    post_cols = [
-        "season","date","gamePk","teamId","team_side","window_id","strength_global","playerId","token_idx","token_type","t_token","t_end","seconds_token",
-        "post_teammates_onice_ids_w","post_teammates_onice_w","post_teammates_onice_sec_w","post_teammates_onice_share_raw",
-        "post_opponents_onice_ids_w","post_opponents_onice_w","post_opponents_onice_sec_w","post_opponents_onice_share_raw",
-        "post_with_event_GF","post_with_event_GA","post_with_event_SF","post_with_event_SA",
-    ]
-
-    # --- Row ordering (for human review) ---
-    # Within each window, list players in the order they first appear in that window (carried-at-start first),
-    # and then list that player's tokens in time order. This is only an output sort; it does not change token_idx.
-    def _window_num(wid: Any) -> int:
-        s = str(wid or "")
-        digs = "".join(ch for ch in s if ch.isdigit())
-        return int(digs) if digs else 0
-
-    token_type_priority = {
-        "ENTRY": 0,
-        "WINDOW_START": 1,
-        "STATE": 2,
-        "EXIT": 3,
-    }
-
-    first_t: Dict[Tuple[str, str, int], int] = {}
-    for r in token_rows:
-        k = (str(r.get("window_id") or ""), str(r.get("team_side") or ""), int(r.get("playerId") or 0))
-        t = int(r.get("t_token") or 0)
-        if k not in first_t or t < first_t[k]:
-            first_t[k] = t
-
-    token_rows = sorted(
-        token_rows,
-        key=lambda r: (
-            str(r.get("season") or ""),
-            str(r.get("date") or ""),
-            int(r.get("gamePk") or 0),
-            _window_num(r.get("window_id")),
-            # player ordering within window
-            first_t.get(
-                (str(r.get("window_id") or ""), str(r.get("team_side") or ""), int(r.get("playerId") or 0)),
-                int(r.get("t_token") or 0),
-            ),
-            int(r.get("playerId") or 0),
-            # token ordering within player
-            int(r.get("t_token") or 0),
-            token_type_priority.get(str(r.get("token_type") or "").upper(), 99),
-            int(r.get("token_idx") or 0),
-        ),
-    )
-
-    # Write PRE (CIN-safe) token table (default + recommended)
-    extra_pre: List[str] = []
-    if schema == "full":
-        extra_pre = sorted({k for r in token_rows for k in r.keys() if k not in tok_cols_core and not str(k).startswith("post_")})
-    out_pre_csv = os.path.join(args.out_dir, f"player_tokens_pre_{game.gamePk}.csv")
-    write_csv(out_pre_csv, token_rows, tok_cols_core + extra_pre)
-
-    # Also write Parquet (requested for modeling; preserves ordering and types better than CSV).
-    if int(args.write_parquet) != 0:
+        # --- Team rollup (projection of train rows, one row per player/window with only team-context cols) ---
         try:
-            import pandas as pd
-                except Exception:
-            pd = None
-        if pd is not None:
-            out_pre_parquet = os.path.join(args.out_dir, f"player_tokens_pre_{game.gamePk}.parquet")
-            cols_all = tok_cols_core + extra_pre
-            df = pd.DataFrame(token_rows)
-            # ensure deterministic column order (include missing columns as NA)
-            for c in cols_all:
-                if c not in df.columns:
-                    df[c] = None
-            # Keep PRE columns only (avoid writing post_* list columns that don't Parquet-convert cleanly).
-            df = df[cols_all]
-            df.to_parquet(out_pre_parquet, index=False)
-
-    out_post_csv = ""
-    if args.write_post:
-        # Write POST evidence table (overlap/chemistry over horizon) separately to prevent leakage
-        extra_post = sorted({k for r in token_rows for k in r.keys() if k not in post_cols and str(k).startswith("post_")})
-        out_post_csv = os.path.join(args.out_dir, f"player_tokens_post_{game.gamePk}.csv")
-        write_csv(out_post_csv, token_rows, post_cols + extra_post)
-
-    # ENTRY selection supervision (optional)
-    if int(args.entry_negatives) > 0:
-        # Build "seen roster" by team side across the game (skaters only)
-        home_seen: set = set()
-        away_seen: set = set()
-        for hh, aa in team_onice_by_sec:
-            home_seen.update(int(x) for x in hh)
-            away_seen.update(int(x) for x in aa)
-
-        entry_rows: List[Dict[str, Any]] = []
-        group_id = 0
-        for r in token_rows:
-            if str(r.get("token_type", "")).upper() != "ENTRY":
-                continue
-            group_id += 1
-            side = str(r.get("team_side"))
-            t_tok = int(r.get("t_token", 0) or 0)
-            chosen_pid = int(r.get("playerId", 0) or 0)
-            if chosen_pid <= 0:
-                continue
-            our_set, _ = (
-                (set(team_onice_by_sec[t_tok][0]), set(team_onice_by_sec[t_tok][1]))
-                if side == "home"
-                else (set(team_onice_by_sec[t_tok][1]), set(team_onice_by_sec[t_tok][0]))
+            df_team = df_train.copy()
+            try:
+                df_team = df_team.loc[:, ~df_team.columns.duplicated()].copy()
+            except Exception:
+                pass
+            # Map aliases
+            if "gamePk" not in df_team.columns and "gameid" in df_team.columns:
+                df_team["gamePk"] = df_team["gameid"]
+            if "teamId" not in df_team.columns and "teamid" in df_team.columns:
+                df_team["teamId"] = df_team["teamid"]
+            # Ensure opponent_goalie_id_start is present by deriving from goalies_start if missing/blank
+            try:
+                if "opponent_goalie_id_start" not in df_team.columns or df_team["opponent_goalie_id_start"].isna().all():
+                    # Need team_side and goalies_start to infer
+                    if "team_side" in df_team.columns and "goalies_start" in df_team.columns:
+                        def _derive_opp_goalie(row):
+                            try:
+                                gs = row.get("goalies_start") if isinstance(row, dict) else row["goalies_start"]
+                            except Exception:
+                                gs = None
+                            try:
+                                side = row.get("team_side") if isinstance(row, dict) else row["team_side"]
+                            except Exception:
+                                side = None
+                            try:
+                                if isinstance(gs, dict):
+                                    if str(side) == "home":
+                                        return int(gs.get("away", 0) or 0)
+                                    if str(side) == "away":
+                                        return int(gs.get("home", 0) or 0)
+                            except Exception:
+                                return 0
+                            return 0
+                        df_team["opponent_goalie_id_start"] = df_team.apply(_derive_opp_goalie, axis=1)
+            except Exception:
+                # If anything fails, default to 0 to avoid blanks
+                df_team["opponent_goalie_id_start"] = df_team.get("opponent_goalie_id_start", 0)
+            team_required = [
+                "season","date","gamePk","teamId","playerId","positionCode","position","team_side","window_id","strength_global","seconds","rinkid",
+                "xGF","xGA","GF","GA","SF","SA","AF","AA","BF","BA",
+                "elapsed_share_0_5","elapsed_share_6_20","elapsed_share_21_60","elapsed_share_61p",
+                "score_state_start","score_diff_start","home_away","period","clock_s",
+                "long_change","start_prev_break_type","start_prev_break_subtype","media_timeout_start",
+                "after_icing","after_icing_by_team","after_icing_by_opponent","home_last_change_opportunity",
+                "us_skaters_start", "them_skaters_start","tsf_0_5","tsf_6_20","tsf_21_60","tsf_61p","last_change_start","long_change_start","early_mass","fo_took_start","fo_took_won_start","fo_took_lost_start",
+                "zone_start","fo_zone","fo_seen_start","fo_team_won_start","fo_team_lost_start","fo_won_start","fo_lost_start",
+                "fo_O_start","fo_D_start","rest_days_team","b2b_team",
+                "opponent_goalie_id_start",
+            ]
+            for c in team_required:
+                if c not in df_team.columns:
+                    df_team[c] = 0
+            team_cols_present = [c for c in team_required if c in df_team.columns]
+            team_rollup_rows = df_team[team_cols_present].to_dict(orient="records")
+            write_csv(
+                os.path.join(args.out_dir, f"team_rollup_{gamePk}.csv"),
+                team_rollup_rows,
+                team_required,
             )
-            seen_roster = home_seen if side == "home" else away_seen
-            bench_candidates = sorted(int(x) for x in (seen_roster - our_set) if int(x) != chosen_pid)
-            # Deterministic negative sample
-            seed = int(game.gamePk) * 1000003 + int(chosen_pid) * 97 + int(t_tok)
-            negs = stable_sample_ints(bench_candidates, int(args.entry_negatives), seed)
+        except Exception as _e:
+            try:
+                print({"warn":"team_rollup_build_failed","gamePk": gamePk, "error": str(_e)})
+            except Exception:
+                pass
+        if args.csv_only_player_train:
+            print("CSV file written: player_windows_train only.")
+        else:
+            print("CSV files written.")
 
-            # Positive row
-            entry_rows.append(
-                {
-                    "group_id": int(group_id),
-                    "season": r.get("season", ""),
-                    "date": r.get("date", ""),
-                    "gamePk": int(game.gamePk),
-                    "teamId": int(r.get("teamId", 0) or 0),
-                    "team_side": side,
-                    "window_id": r.get("window_id", ""),
-                    "t_token": int(t_tok),
-                    "chosen_playerId": int(chosen_pid),
-                    "candidate_playerId": int(chosen_pid),
-                    "entered": 1,
-                    # a few key instruments/context for selection head
-                    "strength_global": r.get("strength_global", ""),
-                    "strength_team": r.get("sim_strength_team", ""),
-                    "score_diff": r.get("sim_score_diff", ""),
-                    "tok_last_fo_zone": r.get("tok_last_fo_zone", ""),
-                    "win_home_last_change_opportunity": r.get("win_home_last_change_opportunity", 0),
-                    "bench_size_at_t": int(len(bench_candidates)),
-                }
-            )
-            # Negatives
-            for cand in negs:
-                entry_rows.append(
-                    {
-                        "group_id": int(group_id),
-                        "season": r.get("season", ""),
-                        "date": r.get("date", ""),
-                        "gamePk": int(game.gamePk),
-                        "teamId": int(r.get("teamId", 0) or 0),
-                        "team_side": side,
-                        "window_id": r.get("window_id", ""),
-                        "t_token": int(t_tok),
-                        "chosen_playerId": int(chosen_pid),
-                        "candidate_playerId": int(cand),
-                        "entered": 0,
-                        "strength_global": r.get("strength_global", ""),
-                        "strength_team": r.get("sim_strength_team", ""),
-                        "score_diff": r.get("sim_score_diff", ""),
-                        "tok_last_fo_zone": r.get("tok_last_fo_zone", ""),
-                        "win_home_last_change_opportunity": r.get("win_home_last_change_opportunity", 0),
-                        "bench_size_at_t": int(len(bench_candidates)),
-                    }
-                )
-
-        entry_cols = [
-            "group_id","season","date","gamePk","teamId","team_side","window_id","t_token",
-            "chosen_playerId","candidate_playerId","entered",
-            "strength_global","strength_team","score_diff","tok_last_fo_zone",
-            "win_home_last_change_opportunity","bench_size_at_t",
-        ]
-        out_entry_csv = os.path.join(args.out_dir, f"entry_selection_{game.gamePk}.csv")
-        write_csv(out_entry_csv, entry_rows, entry_cols)
-        print(f"Wrote {out_entry_csv} ({len(entry_rows)} rows; {group_id} ENTRY groups)")
-
-    if out_windows_csv:
-        print(f"Wrote {out_windows_csv}")
-    print(f"Wrote {out_pre_csv} ({len(token_rows)} token-rows)")
-    if out_post_csv:
-        print(f"Wrote {out_post_csv}")
-
+def _score_state_bucket(diff: int) -> str:
+    if diff <= -2:
+        return "trail2+"
+    if diff == -1:
+        return "trail1"
+    if diff == 0:
+        return "tie"
+    if diff == 1:
+        return "lead1"
+    return "lead2+"
 
 if __name__ == "__main__":
     main()
-
