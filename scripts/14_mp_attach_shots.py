@@ -29,7 +29,9 @@ import numpy as np
 import pandas as pd
 
 API = Path(r"C:\Users\lilli\Downloads\API\API\Final")
-WIN = {2016: r"D:\2016", 2017: r"D:\2017", 2018: r"D:\2018", 2019: r"D:\2019",
+WIN = {2016: str(API / "2016" / "derived" / "windows"),
+       2017: str(API / "2017" / "derived" / "windows"),
+       2018: r"D:\2018", 2019: r"D:\2019",
        2020: r"D:\2020", 2021: r"D:\2021", 2022: r"D:\2022", 2023: r"D:\2023",
        2024: r"D:\2024", 2025: str(API / "2025" / "derived" / "windows")}
 ART = Path(r"D:\optbot\artifacts")

@@ -22,11 +22,16 @@ SEASON_DIRS = {
     20182019: r"D:\2018", 20192020: r"D:\2019", 20202021: r"D:\2020",
     20212022: r"D:\2021", 20222023: r"D:\2022", 20232024: r"D:\2023",
     20242025: r"D:\2024",
+    # rebuilt seasons live in the API vault (certified V1 engine, Jul 9)
+    20252026: r"C:\Users\lilli\Downloads\API\API\Final\2025\derived",
+    20162017: r"C:\Users\lilli\Downloads\API\API\Final\2016\derived",
+    20172018: r"C:\Users\lilli\Downloads\API\API\Final\2017\derived",
 }
 ART = Path(r"D:\optbot\artifacts")
 K = 5
 
-USECOLS = ["gamePk", "window_id", "playerId", "teamId", "seconds", "duration",
+USECOLS = ["date",   # per-game date — freeze protocol + ledger detection need it
+           "gamePk", "window_id", "playerId", "teamId", "seconds", "duration",
            "teammates_onice_ids_w", "teammates_onice_sec_w",
            "opponents_onice_ids_w", "opponents_onice_sec_w",
            "xGF", "xGA", "GF", "GA", "SF", "SA",
@@ -64,12 +69,15 @@ def do_season(season: int) -> Path:
         print(f"{season}: exists, skip")
         return out
     d = SEASON_DIRS[season]
-    files = [f for f in sorted(glob.glob(f"{d}\\final_windows\\player_windows_train_*_xg.csv"))
-             if "backup" not in f]
+    sub = "windows" if "derived" in d else "final_windows"
+    suf = "" if "derived" in d else "_xg"     # vault seasons are pre-xg-fill
+    files = [f for f in sorted(glob.glob(f"{d}\\{sub}\\player_windows_train_*{suf}.csv"))
+             if "backup" not in f and ("_xg" in f) == (suf == "_xg")]
     rows = []
     for i, fp in enumerate(files):
         df = pd.read_csv(fp, usecols=lambda c: c in USECOLS)
         w = df[["gamePk", "window_id", "playerId", "teamId", "seconds"]].copy()
+        w["date"] = df["date"].iloc[0] if "date" in df.columns and len(df) else None
         parsed_w = [parse_sorted(a, b) for a, b in
                     zip(df["teammates_onice_ids_w"], df["teammates_onice_sec_w"])]
         parsed_v = [parse_sorted(a, b) for a, b in
