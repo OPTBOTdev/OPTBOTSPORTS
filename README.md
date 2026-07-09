@@ -160,6 +160,31 @@ output by contract; bands come only from split-conformal residuals of the frozen
 binned by n_eff, and every band object carries its `achieved_coverage` field. A band without
 its coverage number cannot be emitted. **Status: SOLVED**, enforced by code.
 
+### T19 — Arena scorekeeper bias (measured Jul 2026)
+Recorded micro-events vary wildly by rink: giveaways 2.25x between arenas, takeaways
+2.2x, hits 1.67x — while xG varies only 1.19x. **Defense:** product claims are xG-only
+(T10's twin); rinkid is a conditioned context feature; micro-stat priors flagged
+rink-contaminated pending rink-adjustment. **Status: MEASURED/PRICED.**
+
+### T20 — Zone-context half-life (measured Jul 2026)
+zone_start's information decays to ~zero within 20-30 seconds; 50.7% of >120s windows
+net-oppose their starting zone. Realized zone residence is an OUTCOME (ice-tilt) and is
+permanently banned as a feature. New tower probe: zone_start sensitivity must decay
+with window length. **Status: SOLVED** by classification; stint-ization shortens units
+into zone-info's lifetime.
+
+### T21 — Self-in-team-prior leakage
+Team priors include the focal player's own contribution (~7% of team skater-minutes
+for a star) — talent of high-usage players is understated by a few percent.
+Conservative direction (compresses, never invents). **Fix queued:** leave-one-out team
+priors (v1). **Status: BOUNDED/OPEN.**
+
+### T22 — Ghost incumbents in scenario templates
+11.9% of backtested moves (7.1% trades / 13.4% offseason) had a destination slot
+incumbent who was gone post-move. Slot context outlives its occupant, and the error is
+inside the measured conformal band, but templates move to multi-incumbent slot pools
+in v1. **Status: MEASURED/OPEN.**
+
 The pattern worth noticing: nothing above is hand-waved. Every threat is either structurally
 closed, measurably priced into the band, or refused at the API. That discipline — not any
 single model — is the moat.
