@@ -30,7 +30,10 @@ USECOLS = ["gamePk", "window_id", "playerId", "teamId", "seconds", "duration",
            "teammates_onice_ids_w", "teammates_onice_sec_w",
            "opponents_onice_ids_w", "opponents_onice_sec_w",
            "xGF", "xGA", "GF", "GA", "SF", "SA",
-           "hits_personal", "blocks_personal", "takeaways_forced", "giveaways_committed"]
+           "hits_personal", "blocks_personal", "takeaways_forced", "giveaways_committed",
+           # v3 additions (F2): entry-side stint context + multistint flag source
+           "shift_count_in_window", "entered_after_start", "entry_offset_s",
+           "onice_elapsed_at_window_start", "time_since_last_shift_s"]
 
 Y_RENAME = {"xGF": "y_xGF", "xGA": "y_xGA", "GF": "y_GF", "GA": "y_GA",
             "SF": "y_SF", "SA": "y_SA", "hits_personal": "y_hits",
@@ -77,6 +80,10 @@ def do_season(season: int) -> Path:
         w["vs_seconds"] = [p[1] for p in parsed_v]
         for src, dst in Y_RENAME.items():
             w[dst] = df[src] if src in df.columns else np.nan
+        for c in ("shift_count_in_window", "entered_after_start", "entry_offset_s",
+                  "onice_elapsed_at_window_start", "time_since_last_shift_s"):
+            w[c] = df[c] if c in df.columns else np.nan
+        w["is_multistint"] = (w["shift_count_in_window"].fillna(1) > 1).astype("int8")
         rows.append(w)
         if (i + 1) % 250 == 0:
             print(f"  {season}: {i+1}/{len(files)}")
