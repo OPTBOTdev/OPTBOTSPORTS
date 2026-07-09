@@ -38,6 +38,16 @@ EV_MAP = {"SHOT": "shot-on-goal", "GOAL": "goal", "MISS": "missed-shot"}
 XCOLS = ["xGoal", "xRebound", "xFroze", "xPlayContinuedInZone",
          "xPlayContinuedOutsideZone", "xPlayStopped", "xShotWasOnGoal"]
 FLAGS = ["shotRush", "shotRebound", "shotGeneratedRebound", "shotWasOnGoal", "goal"]
+# style-prior fuel (F23): persisted per-shot so personality priors build from the
+# audit tables without re-reading the 1.1GB MP archive
+STYLE = ["arenaAdjustedShotDistance", "arenaAdjustedXCord", "arenaAdjustedYCordAbs",
+         "shotAngleAdjusted", "speedFromLastEvent", "distanceFromLastEvent",
+         "lastEventCategory", "timeSinceLastEvent", "averageRestDifference",
+         "shooterTimeOnIce", "timeSinceFaceoff", "offWing", "shotType",
+         "shotOnEmptyNet", "shotGoalieFroze", "shotPlayContinuedInZone",
+         "shotPlayContinuedOutsideZone"]
+# NEVER load: timeUntilNextEvent (future info), homeTeamWon (game result on
+# every shot row) — the two SELECT*-someday traps, banned by name.
 
 
 def load_mp_season(year: int) -> pd.DataFrame:
@@ -46,7 +56,7 @@ def load_mp_season(year: int) -> pd.DataFrame:
     src = str(per) if per.exists() else r"D:\shots_2007-2024.zip"
     usecols = ["season", "game_id", "isPlayoffGame", "time", "period", "event",
                "teamCode", "isHomeTeam", "shooterPlayerId", "goalieIdForShot",
-               "homeSkatersOnIce", "awaySkatersOnIce", "shotID"] + XCOLS + FLAGS
+               "homeSkatersOnIce", "awaySkatersOnIce", "shotID"] + XCOLS + FLAGS + STYLE
     if src.endswith(".zip"):
         it = pd.read_csv(src, usecols=lambda c: c in usecols, chunksize=500_000)
         mp = pd.concat([c[c.season == year] for c in it], ignore_index=True)
@@ -144,8 +154,10 @@ def attach_game(gamePk, mp_g, wdir, pbp_dir, acc, write=False, out_dir=None):
         onice_ag = e.onice_away if s.isHomeTeam == 1 else e.onice_home
         rows_shot.append({"gamePk": gamePk, "shotID": s.shotID, "window_id": wid,
                           "team_for": shooter_team_id, "t": t,
+                          "shooterPlayerId": s.shooterPlayerId,
+                          "goalieIdForShot": s.goalieIdForShot,
                           "onice_for": list(onice_for), "onice_against": list(onice_ag),
-                          **{c: getattr(s, c) for c in XCOLS + FLAGS}})
+                          **{c: getattr(s, c, None) for c in XCOLS + FLAGS + STYLE}})
     if not rows_shot:
         return
     sh = pd.DataFrame(rows_shot)
