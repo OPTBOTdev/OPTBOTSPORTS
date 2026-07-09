@@ -272,7 +272,7 @@ Pipeline (each script gated by the previous):
 | Trade/UFA ledger | ✅ BUILT | 729 qualifying moves (196 trades, 533 offseason) |
 | The bar (Marcel) | ✅ MEASURED | **RMSE 5.67 xGF%** (carryover: 7.40) on all 729 |
 | Perfect windows + lines | ✅ BUILT | 7.52M rows, 0 dup keys, 100% mu & line coverage |
-| **Backtest: v0 vs the bar** | ✅ **CLAIM PROVEN** | **RMSE 5.30 vs Marcel 5.80 (−8.6%), 95% CI [−0.67, −0.33] — clear of zero, n=635** |
+| **Backtest: v0 vs the bar** | ✅ **CLAIM PROVEN** | **RMSE 5.44 vs Marcel 6.02 (−9.7%), 95% CI [−0.77, −0.40], n=546** (destination-team-only actuals after the C1 contamination audit; pre-fix figure was −8.6%) |
 | — sliced by move type | ✅ | trades 5.14 · offseason 5.37 — strongest on in-season trades |
 | Conformal bands (T18 replacement) | ✅ CALIBRATED | **79.8% achieved at 80% target** (vs legacy Kalman's 12%) |
 | K refit vs next-season aggregates | ⏳ NEXT | current fit hit grid edge — noisy per-game target |

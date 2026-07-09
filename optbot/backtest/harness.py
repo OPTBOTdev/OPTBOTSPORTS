@@ -27,7 +27,8 @@ def run(ledger: pd.DataFrame, obs: pd.DataFrame, windows: pd.DataFrame,
     rows = []
     for mv in ledger.itertuples():
         t0 = mv.move_date
-        actual = actual_post_move(obs, mv.player_id, t0, horizon_games)
+        actual = actual_post_move(obs, mv.player_id, t0, horizon_games,
+                                  to_team=mv.to_team)
         if not actual["ok"]:
             continue
         tal = snapshot(asof_talent, t0, K_minutes)

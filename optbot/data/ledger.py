@@ -34,10 +34,20 @@ def qualify(ledger: pd.DataFrame, obs: pd.DataFrame,
 
 
 def actual_post_move(obs: pd.DataFrame, player_id: int, move_date: str,
-                     horizon_games: int = 40) -> dict:
-    """Ground truth: first N games' 5v5 on-ice rates after the move."""
+                     horizon_games: int = 40, to_team: int | None = None) -> dict:
+    """Ground truth: first N games' 5v5 on-ice rates after the move.
+
+    to_team: REQUIRED for backtests (C1 audit, Jul 2026): 19.8% of moves had
+    wrong-team games (re-trades / next-season signings) polluting first-40 actuals,
+    which diluted v0's edge specifically. Pass the destination teamId and ensure
+    obs carries a per-game `teamId` column; games for other teams are excluded.
+    """
     ev = obs[(obs.strength_global == "5v5") & (obs.playerId == player_id)
              & (obs.date >= move_date)].sort_values("date")
+    if to_team is not None:
+        if "teamId" not in ev.columns:
+            raise ValueError("obs lacks teamId — join people_outcomes team map first")
+        ev = ev[ev.teamId == to_team]
     games = ev.drop_duplicates("gamePk").head(horizon_games)["gamePk"]
     w = ev[ev.gamePk.isin(games)]
     m = w["toi_sec"].sum() / 60.0
