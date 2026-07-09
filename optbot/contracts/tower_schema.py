@@ -33,7 +33,7 @@ MARG = [
     "seconds", "duration",                    # exposure (loss weights / offsets)
     "shift_count_in_window", "time_since_last_shift_s", "last_shift_len_s",
     "onice_elapsed_at_window_start", "entered_after_start", "entry_offset_s",
-    "stint_duration_max", "is_multistint",    # blended-row flag: trainer downweights
+    "is_multistint",                          # blended-row flag: trainer downweights
 ]
 
 # ---- BANNED (with reasons — cite these when someone asks) ------------------
