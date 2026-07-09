@@ -12,8 +12,10 @@ import pandas as pd
 
 
 class ConformalBands:
-    def __init__(self, target: float = 0.80, n_eff_edges=(0, 25, 50, 1e9)):
-        # n_eff here is in TOI-hours (talent_n_eff units)
+    def __init__(self, target: float = 0.80, n_eff_edges=(0, 8, 15, 1e9)):
+        # n_eff is in DECAYED TOI-hours (talent_n_eff units): half-life-40 caps
+        # veterans near ~17h, so edges 8/15 split rookie / mid / established.
+        # (The old 25/50 edges put everyone in bin 0 — degenerate, F3 fix.)
         self.target = target
         self.edges = list(n_eff_edges)
         self.q_: dict[int, tuple[float, float]] = {}
