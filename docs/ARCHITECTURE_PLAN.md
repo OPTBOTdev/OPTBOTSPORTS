@@ -87,9 +87,23 @@ x = [h_env ⊕ talent channel ⊕ bio] → 4x768 SwiGLU residual, FiLM(17 levers
 4. Beat v0 (5.74) on the 860-move harness, CI clear of zero.
 5. Beat the GBDT twin (trunk gate [B4]).
 6. Conformal refit on v1 errors; coverage 78-82% per bin.
-7. **[K2] Role-delta slice reported**: error vs |role change| — quantifies the
-  lever-transfer ceiling (T23's sharpest tooth) and what the v2 usage-model buys.
-  (Runnable on v0 TODAY — baseline slice before GPU.)
+7. **[K2] Role-delta slice — MEASURED (Jul 2026, n=860):**
+   | realized usage change | n | v0 RMSE | edge vs Marcel | band coverage |
+   |---|---|---|---|---|
+   | <1 min/night | 391 | 5.30 | +11.6% | 79.3% |
+   | 1–2 min | 276 | 6.10 | +5.2% | 75.7% |
+   | 2–4 min | 173 | 6.06 | +3.4% | 71.1% |
+   | >4 min | 20 | 6.17 | +9.7% | 75.0% |
+   Findings: (a) T23 is real but bounded — v0 NEVER loses to Marcel in any bin;
+   corr(|usage change|, error) = 0.03 at individual level. (b) CONDITIONAL
+   MISCALIBRATION found: marginal 80% coverage hides 71% in the 2–4min bin.
+   FIX (v2.2): conformal gains a second dimension — INTENDED role delta
+   (|prior TOI-role − queried slot|, knowable at t0). Queries projecting a
+   player into a different role than he held draw bands from the wide-change
+   error quantiles, not the marginal pool. Ship-gate 6 now requires coverage
+   78–82% PER (n_eff × intended-role-delta) CELL, not just marginally.
+   (c) The v2 usage-model's measurable prize: recover the +11.6% edge in the
+   changed-role bins — worth ~6 points of edge on ~40% of moves.
 Fail any → v0 ships in October, v1 iterates. The company never depends on the net.
 
 ## 6. DISCLOSED LIMITS (the honest floor of the design)
