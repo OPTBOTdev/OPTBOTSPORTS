@@ -16,7 +16,22 @@ SYNTH_CONTEXT = [
     "after_icing", "ai_OZ_start", "ai_DZ_start",        # traced PRE-safe (icing flags)
     "bench_rights", "long_change", "home_away", "rinkid", "skater_diff",
 ]
-SYNTH_SCHEDULE = ["rest_days_team", "b2b_team"]
+SYNTH_SCHEDULE = ["rest_days_team", "b2b_team",
+                  # F-2 fix: the settling-in curve is MODELED, not smeared.
+                  # games-with-current-team is fully knowable at serving (game 7
+                  # with the new club is game 7); as an explicit input, post-trade
+                  # adjustment effects stop contaminating the ambient weights.
+                  "games_since_team_change",
+                  # F-3: destination coach is known at serving; system effects
+                  # beyond roster live here (orphan: game_coach_ids_2017_2025)
+                  "coach_id", "coach_tenure_games"]
+
+# F-1 CONTRACT (teammate-form echo): any dynamic-shell 'recent form' feature for
+# teammates/opponents MUST be computed LEAVE-FOCAL-OUT (excluding windows shared
+# with the focal player) or season-lagged. A teammate's recent xG rate earned
+# NEXT TO the focal player echoes the focal player's own quality back into
+# h_env — identity leakage by reflection. Enforced at rollup build + probe P3.
+SHELL_FORM_RULE = "leave_focal_out_or_season_lagged"
 SYNTH_TEAM_PRIORS = [
     "team_xgf60_prior_ev", "team_xga60_prior_ev", "team_pace60_ev_prior",
     "opp_team_xgf60_prior_ev", "opp_team_xga60_prior_ev", "opp_team_pace60_ev_prior",
