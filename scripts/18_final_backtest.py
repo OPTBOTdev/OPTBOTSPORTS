@@ -26,9 +26,18 @@ ART = Path(r"D:\optbot\artifacts")
 def build_mp_playergame() -> pd.DataFrame:
     po = pd.read_parquet(ART / "people_outcomes_all.parquet",
                          columns=["season", "gamePk", "window_id", "playerId",
-                                  "teamId", "seconds", "date"])
+                                  "teamId", "seconds", "date", "strength_global"])
+    # 5v5 ONLY: run-1 of this backtest summed PP/PK window credits into the
+    # actuals (RMSE ballooned for ALL projectors incl. Marcel — the signature
+    # of an actuals-definition bug, not a model failure). v0 predicts 5v5;
+    # actuals must be 5v5.
+    is55 = po.strength_global.astype(str).str.replace("_", "").str.lower() \
+        .isin(["5v5", "5v55v5"])
+    po = po[is55].drop(columns=["strength_global"])
     frames = []
     for d in sorted(glob.glob(str(ART / "mp_attach_*"))):
+        if not Path(d).is_dir() or not Path(d).name.split("_")[-1].isdigit():
+            continue                          # skips mp_attach_all.log etc.
         yr = int(Path(d).name.split("_")[-1])
         files = glob.glob(f"{d}/mp_pw_*.parquet")
         if files:
@@ -78,6 +87,12 @@ if __name__ == "__main__":
     print("moves by year:", by_yr.to_dict())
 
     windows = pd.read_parquet(ART / "perfect_windows_v3.parquet")
+    if "date" not in windows.columns:                  # merge-suffix casualty guard
+        for cand in ("date_x", "date_y"):
+            if cand in windows.columns:
+                windows = windows.rename(columns={cand: "date"})
+                break
+    windows["date"] = pd.to_datetime(windows["date"])
     windows = windows[windows.mu_xgf60.notna()]        # env needs OOF mu
     lines = pd.read_parquet(ART / "lines.parquet")
     asof = pd.read_parquet(ART / "talent_asof.parquet")

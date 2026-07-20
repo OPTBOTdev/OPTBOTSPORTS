@@ -13,7 +13,8 @@ if __name__ == "__main__":
     pw = pw[pw.season != 20172018]
     po = pd.read_parquet(ART / "people_outcomes_all.parquet")
     keys = ["season", "gamePk", "window_id", "playerId"]
-    v2 = pw.merge(po.drop(columns=["teamId", "seconds"]), on=keys, how="inner")
+    drop = [c for c in ("teamId", "seconds", "date", "strength_global") if c in po.columns]
+    v2 = pw.merge(po.drop(columns=drop), on=keys, how="inner")
     print(f"v1 rows (7 seasons): {len(pw):,}  ->  v2 rows: {len(v2):,} "
           f"({len(v2)/len(pw):.2%} matched)")
 

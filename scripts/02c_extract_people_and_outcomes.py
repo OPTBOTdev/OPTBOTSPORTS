@@ -31,6 +31,7 @@ ART = Path(r"D:\optbot\artifacts")
 K = 5
 
 USECOLS = ["date",   # per-game date — freeze protocol + ledger detection need it
+           "strength_global",   # 5v5 scoping of MP player-game actuals (backtest run-1 bug)
            "gamePk", "window_id", "playerId", "teamId", "seconds", "duration",
            "teammates_onice_ids_w", "teammates_onice_sec_w",
            "opponents_onice_ids_w", "opponents_onice_sec_w",
@@ -78,6 +79,7 @@ def do_season(season: int) -> Path:
         df = pd.read_csv(fp, usecols=lambda c: c in USECOLS)
         w = df[["gamePk", "window_id", "playerId", "teamId", "seconds"]].copy()
         w["date"] = df["date"].iloc[0] if "date" in df.columns and len(df) else None
+        w["strength_global"] = df["strength_global"] if "strength_global" in df.columns else "5v5"
         parsed_w = [parse_sorted(a, b) for a, b in
                     zip(df["teammates_onice_ids_w"], df["teammates_onice_sec_w"])]
         parsed_v = [parse_sorted(a, b) for a, b in
