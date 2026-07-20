@@ -1,117 +1,112 @@
-# The OptBot CIN — Final Architecture Plan (canonical, v2.0 · Jul 2026)
+# The OptBot CIN — Final Architecture Plan (canonical, v2.1 · Jul 2026)
 
-The single source of truth for how Phases A/B/C are built, trained, gated, and
-composed. Supersedes scattered specs. Incorporates audit fixes F-1..F-6 and names
-the platform's deepest assumption (T23).
-
----
-
-## 0. The estimand everything serves
-
-For player p, freeze date t0, hypothetical destination environment E':
-
-    theta(p, E', t0) = E[ first-40-game on-ice impact | do(E ~ E'), history(p, <t0) ]
-
-shipped as xGF% with a conformal band whose coverage is measured, plus deterministic
-value lines (penalty economy; finishing economy F-5; age adjustment F-6).
+Single source of truth for Phases A/B/C. v2.1 incorporates the second adversarial
+pass: K-1..K-3 (critical), S/A/B-series hardening. Every fix is listed inline where
+it lives, marked [Kx]/[Sx]/[Ax]/[Bx].
 
 ---
 
-## 1. PHASE A — the Environment Tower  (h_env, 256d)
+## 0. Estimand
 
-Job: encode "the ice around the focal player" so that swapping it is exact.
-
-### Inputs (tower_schema.py is the law)
-- PEOPLE: <=5 teammates + <=5 opponents. Each member =
-  [ static ID core (96d, shared learned table, ~1.7k players)
-    ⊕ dynamic shell: age-at-date, position, handedness, TOI-role,
-      recent-form prior — **LEAVE-FOCAL-OUT (F-1)** or season-lagged ]
-  -> member MLP -> seconds-biased attention pooling -> h_with, h_vs
-- CONTEXT: score/zone-start/period/rink/rest/entry-mode/manpower embeddings
-  + team priors (pace, xG rates, goalie tier/GSAA) via LayerNorm+MLP
-  + **games_since_team_change (F-2: the settling-in curve as explicit input)**
-  + **coach_id + tenure (F-3, from game_coach_ids_2017_2025)**
-- FUSION: 2 pre-norm attention blocks over [h_with, h_vs, h_ctx] + CLS -> h_env
-
-### Hard exclusions (unchanged, enforced)
-No focal identity anywhere. No banned features (traced convictions). No season/era
-embedding. UNK path: unseen IDs -> position x role fallback core + FULL dynamic
-shell (the AHL inference mode — unseen players are shell-only, graceful).
-Teammate dropout 15-25% (anti-fingerprint + serving realism).
-Size: ~2-3M params, deliberately starved.
-
-### Phase A gates
-5-probe scorecard/epoch (incl. zone-decay probe) + ablation vs slot-average env.
+theta(p, E', t0) = E[ first-40-game on-ice impact | do(E ~ E'), history(p, <t0) ]
+Shipped: xGF% + conformal band (coverage attached, extrapolation-flagged [K3])
++ value lines (penalty economy · finishing economy · age delta).
 
 ---
 
-## 2. PHASE B — the CIN Trunk
+## 1. SCENARIO BUILDER
 
-    x = [ h_env  ⊕  talent-channel(z_off, z_def, se, n_eff)  ⊕  bio(age, age², hand) ]
-    4 x 768 pre-norm SwiGLU residual blocks, FiLM-conditioned on the 17-lever vector
-    -> 10 heads (mu, log_sigma): xGF/xGA Gaussian-heteroscedastic;
-       counts Poisson-with-exposure-offset; Kendall-Gal learnable task weights
+- Slot's real pre-t0 windows, bootstrap x2000, multi-incumbent pools (T22, dilutes
+  incumbent bleed [S1]).
+- Future-schedule weighting by JOINT (opponent, venue, rest-class) — never
+  marginals; no Frankenstein windows [S2].
+- Settling-in integrated over games 1..40 via gsc input [F2].
+- Overrides: linemates / goalie / coach.
+- **[K3] JOINT-SUPPORT SCORE**: co-occurrence prior over the pinned WITH-set +
+  role-delta distance from the ledger distribution. Below threshold →
+  band emitted with explicit `extrapolated: true`; far below → REFUSED_OOS.
+  Marginal support checks alone are not enough for pinned combinations.
+- Opponent five at serving is team-known, lineup-guessed — the weakest-typed
+  input [A4]; opponent-line sampling sensitivity is a standing ablation.
 
-- Separated pathways = C2 structural deconfounding (talent cannot be re-derived
-  from usage; env cannot contain the focal player).
-- Loss weights: exposure seconds (stop-bias defense) x switch-weight 3x within
-  10 games of a change — **now safe because gsc is an input (F-2), the model
-  attributes adjustment effects to the curve, not to ambient reweighting.**
-- Era-split checkpoints (<=2021/22/23/24) — freeze-legal backtesting forever.
-- GBDT twin on the identical legal tabular surface = referee.
-- Internal sigmas: training + ranking only. Human-facing bands = conformal, always.
+## 2. PHASE A — Environment Tower (~2M params)
 
-### Phase B gates
-Beat v0 (5.74 on the 860-move harness) CI-clear; beat the twin; probes green.
-Loses => v0 ships; B iterates. The company never depends on the net.
+Member representation (teammates + opponents, <=5 each):
+  STATIC CORE: learned 96d ID vector (shared table ~1.7k; starved)
+  DYNAMIC SHELL (computed, as-of-date): age · position · handedness · TOI-role ·
+    recent form (LEAVE-FOCAL-OUT or season-lagged — the echo rule [F1]) ·
+    **member's own games_since_team_change [A1] — everyone settles, not just
+    the focal player; also dilutes old-system residue in cores**
+  → member MLP → seconds-biased attention pooling → h_with, h_vs (256d)
 
----
+Context: score/zone/period/rink/rest/entry-mode/manpower embeds · team priors
+(pace/xG/goalie) · focal gsc [F2] · **coach: id embedding + COACH SHELL
+(tenure, career style priors) with shrinkage — ~100 coaches, thin samples,
+and new-coach UNKs are exactly the interesting case [A5/F3]** → h_ctx (256d)
 
-## 3. PHASE C — the Player Side (computed first, learned later)
+Fusion: 2 pre-norm attention blocks over [h_with, h_vs, h_ctx] + CLS → h_env (256d)
 
-- NOW (validated): talent scalars — decayed, league-demeaned OOF residuals,
-  EB-shrunk. This IS the proven -7.6%.
-- CHEAP LAYERS (computed, no GPU): penalty economy (shipped) · finishing economy
-  from shot cards (F-5) · age-curve delta (F-6).
-- v2 (post-A/B, gated): style vector 8-16d distilled from the 13,708 shot-
-  personality cards + process priors; interacts with tower people-embeddings
-  for FIT/chemistry. Gated by identifiability census + its own probes.
-- v2.5: iterate talent<->model EM one more round; LOO team priors (T21).
+Absent by design: focal identity · season/era ids · convicted features.
+Teammate dropout 20%. UNK = shell-only members (AHL inference mode).
 
----
+## 3. PHASE B — CIN Trunk
 
-## 4. SERVING FLOW (one query, end to end)
+x = [h_env ⊕ talent channel ⊕ bio] → 4x768 SwiGLU residual, FiLM(17 levers)
+→ 10 heads (xG heteroscedastic Gaussian; counts Poisson-offset; Kendall-Gal).
+- **[B2] micro-stat heads (hits/give/take) gradients DETACHED from the tower** —
+  arena-scorer noise (T19) may not shape h_env; those heads learn on the trunk only.
+- Exposure-seconds weights (stop-bias defense) · switch-weight x3 (safe: gsc is
+  an input, adjustment is modeled not smeared [F2]).
+- Era-split checkpoints (<=2021/22/23/24). **[B3] all ablation comparisons hold
+  era fixed.**
+- **[B4] Gate mapping, explicit:** GBDT twin (tabular-only) judges the TRUNK's
+  value-add; the TOWER's own gate is ablation vs slot-average env. Two gates,
+  two questions.
+- Internal sigmas never face humans; conformal only.
 
-    query(p, dest, line, linemates?, coach?, date)
-      -> scenario: slot windows < t0, bootstrap 2000
-         + **known-future-schedule weighting (F-4: upcoming opponents are
-           public at t0 — legally visible future)**
-         + gsc set to 1..40 across horizon (adjustment curve integrated)
-         + goalie/linemate/coach overrides
-      -> support gate (T1 answer / T2 in-range / T3 REFUSED_OOS)
-      -> v1 trunk forward passes (or v0 fallback: mu-average + talent)
-      -> xGF% + conformal band (with achieved coverage attached)
-      -> + penalty economy line + finishing line + age note
+## 4. PHASE C — Player Side
 
----
+- NOW: talent scalars (proven −7.6%): decayed, league-demeaned OOF residuals, EB-shrunk.
+- **[K1] HARD SHIP-GATE FOR v1: talent must be RE-DERIVED as residual vs the
+  TOWER-based environment before v1 ships (EM round 2, now mandatory).**
+  Reason: current residuals contain unclaimed linemate credit (baseline is
+  identity-blind). v0: errors partially cancel. v1: the tower credits linemates
+  → same value counted twice → systematic overprediction for star-adjacent
+  players leaving their stars. The exact GM question ("is he real without X?")
+  would be answered wrong. No v1 ship without re-derivation.
+- Cheap layers: penalty economy ✅ · finishing economy (shot cards) · age delta.
+- v2: style vector (8-16d, offense-typed for now [C2] — defensive-style source
+  queued) → interacts with tower people-embeddings = FIT/chemistry, gated by
+  identifiability census.
 
-## 5. THE DEEPEST ASSUMPTION — T23, disclosed
+## 5. GATES — the full ship checklist for v1
 
-Environments adapt to players: after arrival, his usage becomes HIS, lines
-reshuffle around him. We hold the environment fixed at the role template; reality
-flexes it. Priced (conformal is fit on real moves where adaptation happened);
-kept honest (identical crudeness in backtest and product). v2 frontier: two-stage
-model — predict his USAGE at the destination first, then outcomes given usage.
-No one in this industry models this; we at least name it.
+1. 5-probe scorecard green every epoch (incl. zone-decay probe).
+2. Tower ablation: beats slot-average env (era-fixed [B3]).
+3. **[K1] Talent re-derived vs tower-env (EM round 2) and sniff re-passed.**
+4. Beat v0 (5.74) on the 860-move harness, CI clear of zero.
+5. Beat the GBDT twin (trunk gate [B4]).
+6. Conformal refit on v1 errors; coverage 78-82% per bin.
+7. **[K2] Role-delta slice reported**: error vs |role change| — quantifies the
+  lever-transfer ceiling (T23's sharpest tooth) and what the v2 usage-model buys.
+  (Runnable on v0 TODAY — baseline slice before GPU.)
+Fail any → v0 ships in October, v1 iterates. The company never depends on the net.
 
----
+## 6. DISCLOSED LIMITS (the honest floor of the design)
 
-## 6. BUILD ORDER
+- T23: environments adapt to players (usage becomes HIS). Priced by conformal;
+  v2 frontier = two-stage usage-then-outcome model.
+- [A6] settling curve learned on trade-selected players (composition blended in).
+- [A4] serving-time opponent lineups are sampled, not known.
+- [G1/K3] bands are measured on real moves; unlike-anything hypotheticals carry
+  the `extrapolated` flag rather than a false guarantee.
 
-1. LOO teammate-form rollup (F-1) + coach join (F-3) -> perfect windows v3.1
-2. Tower+trunk trainer (scripts/19): assert_legal, probes/epoch, era splits,
-   gsc input, teammate dropout, hybrid likelihoods  [READY FOR GPU]
-3. Train + ablations (features earn their place empirically)
-4. The shootout on the 860-move harness
-5. F-4 scenario schedule-weighting, F-5/F-6 value lines (any afternoon)
-6. September: seal 2026-27. October: public scoring.
+## 7. BUILD ORDER
+
+1. Rollups: LOO member-form [F1] · member gsc [A1] · coach table+shell [A5] → v3.1
+2. [K2] role-delta slice of the 860 backtest (CPU, tonight-class)
+3. Trainer (scripts/19): everything above baked in → READY FOR GPU
+4. Train + era-fixed ablations → tower gate
+5. [K1] talent re-derivation vs tower-env → sniff → harness shootout (full gate list)
+6. [K3] joint-support + extrapolation flags in serving
+7. September seal · October public scoring
