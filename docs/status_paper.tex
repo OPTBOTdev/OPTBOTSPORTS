@@ -1,0 +1,160 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+
+\title{\textbf{OptBot: Toward the Most Accurate Sports Simulation Ever Built}\\
+\large What Is Proven, What Is Built, and What Remains}
+\author{OptBot Research \\ \small Status Report v1.0 --- July 2026 --- Confidential}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent OptBot projects what an NHL player becomes in an environment he has never
+played in --- before a single shift is observed there. This report separates, without
+spin, what is \emph{proven}, what is \emph{built}, and what is \emph{still to come}.
+The headline: on 860 real player--team transitions spanning July 2019 through the 2025
+off-season --- scored against independently licensed MoneyPuck expected-goals actuals,
+with every input frozen at each move date --- the \emph{minimal} version of the system
+already beats the industry-standard projection by 7.6\% (RMSE 5.74 vs.\ 6.21; bootstrap
+95\% CI on the difference $[-0.61, -0.33]$, excluding zero), and its 80\% uncertainty
+intervals achieve \textbf{80.0\%, 80.0\%, and 79.8\%} measured coverage across player-%
+experience bins. No neural network has yet been trained: these results come from
+audited statistics alone, and they define the floor --- not the ceiling --- of the
+system. The neural phases (A: environment tower; B: causal trunk; C: style vectors)
+are designed, coded, and gated, awaiting their first GPU hour.
+\end{abstract}
+
+\section{What Is Proven}
+
+\subsection{The headline results}
+
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Projector & RMSE (xGF\%, first 40 GP) & vs.\ Marcel & 95\% CI & $n$ \\
+\midrule
+Last-season carryover & 7.71 & $+24\%$ worse & --- & 860 \\
+Marcel (industry standard) & 6.21 & --- & --- & 860 \\
+\textbf{OptBot v0} & \textbf{5.74} & $\mathbf{-7.6\%}$ & $[-0.61,\,-0.33]$ & 860 \\
+\midrule
+\multicolumn{5}{@{}l@{}}{\small Companion result, in-house xG actuals, 2021--2025 ledger:
+v0 5.44 vs.\ Marcel 6.02 ($-9.7\%$, CI $[-0.77,-0.40]$, $n=546$).}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Three properties make these numbers unusually hard to attack:
+\begin{enumerate}[nosep]
+\item \textbf{Frozen-clock discipline.} Every projection uses only information strictly
+before its move date; an executable audit re-runs sampled moves with all post-date data
+physically deleted and asserts bit-identical output.
+\item \textbf{Independent actuals.} The extended backtest is scored on MoneyPuck's
+expected-goals model (used with permission), not our own --- the referee is not on our
+payroll. The two rulers agree at $r = 0.925$ per window.
+\item \textbf{Era transport.} The margin survives seven distinct eras, including thin-%
+history 2019--20, COVID seasons, and 64 summer-2025 signings scored against the
+just-completed 2025-26 season. Edges that are artifacts collapse out-of-era; this one
+traveled.
+\end{enumerate}
+
+\subsection{Calibration: the result behind the result}
+
+Every projection ships with an 80\% interval fit by split-conformal inference on
+historical moves. Measured coverage: \textbf{0.800 / 0.800 / 0.798} across rookie,
+mid-career, and veteran bins. To our knowledge no commercial sports-projection vendor
+publishes measured calibration at all; the predecessor system this project replaced
+achieved 12\% at the same nominal level. Accuracy wins arguments; \emph{measured honesty}
+wins contracts.
+
+\subsection{Distance to the theoretical ceiling}
+
+Forty games of on-ice xGF\% carries an irreducible sampling noise floor of roughly 4
+RMSE points --- no model, however perfect, can beat it. Against the \emph{closable} gap
+(Marcel at 6.21 down to the $\sim$4.0 floor), v0 alone --- one scalar per player plus a
+destination-environment average --- has already captured $\approx 21\%$. The remaining
+$\sim$1.7 points are the neural phases' hunting ground, and the reason ``most accurate
+sports simulation ever built'' is a trajectory with a measured starting point rather
+than a slogan.
+
+\subsection{The data substrate (what ``certified'' means)}
+
+The training surface (6.5M+ player-windows, ten seasons collected) passed five
+independent certifications: (i) machine-checked internal contracts; (ii) external
+reconciliation vs.\ MoneyPuck (95.9\% exact 5v5 goal agreement over 8,265 games);
+(iii) NHL-API spot audit (94--98\% presence/event/bounds agreement); (iv) the original
+builder's own zero-issue full-season token audits, rediscovered and adopted as
+regression gates; (v) a full-season event microscope against official shift charts:
+99.7\% of 986{,}920 player-window second-counts exact to $\le$1s, \textbf{100.00\%} of
+754{,}104 personal-event attributions correct, and \textbf{zero} goals mis-credited
+across 59{,}807 on-off-on substitution cases. Separately, all 617 lagged prior columns
+passed an empirical prediction-symmetry test (worst leak-gap 0.005 vs.\ 0.902 for a
+deliberate-leak control): the priors are \emph{provably} lagged, not assumed lagged.
+Twenty-two named causal threats are tracked in a public register; each is closed,
+measured, priced into the intervals, or refused at the API. Fourteen silent data
+corruptions --- including an outcomes column that was identically zero across 761{,}823
+rows --- were found and repaired along the way; several fixes \emph{improved} the
+headline (cleaning the test set raised the measured edge from $-8.6\%$ to $-9.7\%$).
+
+\section{What Is Built But Not Yet Trained}
+
+v0 is deliberately minimal: destination-environment expectation plus a deconfounded,
+empirical-Bayes-shrunk talent scalar. It cannot see linemates, lever settings, or
+playing style. The machinery that can --- the actual Causal Intervention Network ---
+is coded, unit-tested, and gated, but has consumed \textbf{zero GPU-hours}:
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Phase & Role & Status & Ship gate \\
+\midrule
+A --- Environment tower & encode \emph{who is on the ice} & coded, untrained &
+5-probe leakage scorecard \\
+B --- CIN trunk & levers, talent channel, outcomes & coded, untrained &
+beat v0 in the 860-move harness \\
+C --- Style vectors & fit \& chemistry (13,708 shot- & priors built, &
+probe-gated; v2 \\
+ & personality cards precomputed) & vectors unstarted & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Supporting assets already banked for these phases: a per-shot attachment of
+MoneyPuck's full shot model to our windows (99.86\% match; boundary-second assignment
+ruled by event order --- a 7\% -of-shots bug class caught before it shipped); rush /
+rebound / chaos / pressure target decompositions; entry-mode context (on-the-fly
+entrants measured at $+12\%$ xGF/60 --- a selection effect the tower conditions on);
+and a feature-legality schema whose banned list cites the code trace that convicted
+each leaky column.
+
+\section{What Remains}
+
+\begin{enumerate}[nosep]
+\item \textbf{First GPU run} (Phase A tower + Phase B trunk, era-split): the per-phase
+feature ablations happen here, empirically, judged by the harness and the probes ---
+legality was decided by trace; utility is decided by experiment.
+\item \textbf{The shootout:} v1 must beat v0's 5.74 with a CI clear of zero, beat its
+own gradient-boosted twin, and pass all probes --- or v0 ships. The company does not
+depend on the neural result; it is upside with a floor.
+\item \textbf{Phase C v2:} style vectors and pairwise fit, unlocked only after A+B ---
+the chemistry claims will be gated by an identifiability census, not enthusiasm.
+\item \textbf{September:} projections for every 2026-27 mover, hash-sealed before puck
+drop. \textbf{October:} the sport watches them score in public. That --- accuracy,
+performed live, with measured error bars --- is the world-shocking act; the numbers
+above are what make it safe to attempt.
+\end{enumerate}
+
+\section*{One-Sentence Summary}
+
+Before training a single neural network, OptBot already beats the sport's standard
+projection method by 7.6\% on 860 frozen-clock trades scored by an independent referee,
+with uncertainty intervals accurate to two-tenths of a percent --- and every component
+that could make it dramatically better is built, audited, and waiting for its first
+GPU hour.
+
+\end{document}
