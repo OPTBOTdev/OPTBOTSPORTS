@@ -49,6 +49,17 @@ Fusion: 2 pre-norm attention blocks over [h_with, h_vs, h_ctx] + CLS → h_env (
 Absent by design: focal identity · season/era ids · convicted features.
 Teammate dropout 20%. UNK = shell-only members (AHL inference mode).
 
+**F-1 MEASURED (Jul 2026, n=128k):** corr(teammate form, focal talent):
+naive-current 0.310 → season-lagged 0.267. Finding: most of that correlation
+is REAL assortative line-building (good players ride with good players — signal
+the tower SHOULD see), not echo. Season-lag removed the same-season echo (~14%);
+residual long-duo echo goes with exact pairwise LOO (v1.1). CONSEQUENCE — probe
+refinement: P3-focal now tests INCREMENTAL leakage: h_env may predict focal
+talent no better than a baseline given raw teammate-quality features alone.
+(A probe demanding zero correlation would flunk every good tower for seeing
+true assortativity.) Rollups shipped: member_shells.parquet (344,543 rows:
+season-lagged form + member gsc), coach_table.parquet (82 coaches, tenure).
+
 ## 3. PHASE B — CIN Trunk
 
 x = [h_env ⊕ talent channel ⊕ bio] → 4x768 SwiGLU residual, FiLM(17 levers)
