@@ -20,6 +20,25 @@
 <body>
 
 <h1>Feature &amp; Data Audit — Role Brief</h1>
+
+<div class="box"><b>🚀 Getting started (5 minutes):</b>
+<ol style="margin:6px 0 2px 18px">
+<li><b>Clone the repo:</b> <code>git clone https://github.com/OPTBOTdev/OPTBOTSPORTS.git</code>
+&nbsp;then <code>cd OPTBOTSPORTS</code>. Work on a branch: <code>git checkout develop</code>.</li>
+<li><b>Python setup:</b> <code>pip install -e ".[dev]"</code> (needs Python 3.11+;
+pandas/pyarrow install automatically). Run <code>python -m pytest tests -q</code> — 7 tests
+should pass.</li>
+<li><b>Docs:</b> everything you need is in <code>docs/</code> — this file, plus the two
+manuals linked below (open them locally in a browser; links between them work inside the
+folder).</li>
+<li><b>Data:</b> the parquets/CSVs are NOT in git (too big) — they live on Griffin's
+workstation at <code>D:\optbot\artifacts\</code> and the raw vault at
+<code>C:\Users\lilli\Downloads\API\API\Final\</code>. Griffin gives you machine or share
+access; all example commands in the manuals use those paths.</li>
+<li><b>Rules:</b> never commit data files · run <code>python -m ruff check .</code> before
+pushing · anything that smells wrong gets reported, not "probably fine"-d.</li>
+</ol></div>
+
 <p><b>Your job in one sentence:</b> verify every number our models eat, and evaluate the
 numbers we DON'T have yet — how easy to get, and whether they matter for the MVP.</p>
 
