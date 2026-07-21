@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OptBot — Engineer Handoff Package</title>
+<style>
+  :root { --navy:#16294A; --red:#D7263D; --ice:#EDF3FB; --gray:#5B6B82; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; color:#222; max-width:900px;
+         margin:0 auto; padding:24px; line-height:1.55; }
+  h1 { color:var(--navy); font-size:26px; border-bottom:3px solid var(--red); padding-bottom:8px; }
+  h2 { color:var(--navy); font-size:20px; margin-top:36px; }
+  h3 { color:var(--red); font-size:15px; margin-top:22px; }
+  code, pre { background:var(--ice); border-radius:6px; font-family:Consolas,monospace; font-size:13px; }
+  code { padding:1px 6px; }
+  pre { padding:12px; overflow-x:auto; border:1px solid #d6e2f2; }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; margin:10px 0; }
+  th { background:var(--navy); color:#fff; text-align:left; padding:7px 9px; }
+  td { border:1px solid #d6e2f2; padding:6px 9px; vertical-align:top; }
+  tr:nth-child(even) td { background:var(--ice); }
+  .tag { display:inline-block; background:var(--red); color:#fff; border-radius:4px;
+         padding:1px 8px; font-size:11px; font-weight:600; letter-spacing:.5px; }
+  .ok { color:#2E7D32; font-weight:600; } .warn { color:#B26A00; font-weight:600; }
+  .box { background:var(--ice); border:1px solid #c9d6e8; border-radius:10px; padding:14px 18px; margin:14px 0; }
+  li { margin:4px 0; }
+</style>
+</head>
+<body>
+
+<h1>OptBot — Engineer Handoff Package</h1>
+<p><b>Welcome aboard.</b> You're joining a system that projects what an NHL player becomes on a
+new team <i>before he plays there</i>. Current state, all reproducible from this repo:
+<b>beats the industry-standard projection by 7.6%</b> on 860 frozen-clock historical moves
+(95% CI clear of zero), with uncertainty bands measured at <b>80.0% coverage vs an 80% claim</b>,
+on data certified five independent ways. Your mission has two parts: <b>(1) one to two days
+verifying the data with your own hands</b> so you trust it, then <b>(2) building the product
+surfaces</b> — the public scoreboard, the GM demo, and the trust layer.</p>
+
+<div class="box"><b>Repo:</b> <code>github.com/OPTBOTdev/OPTBOTSPORTS</code> (clone <code>main</code>).
+<b>Data:</b> parquets/CSVs are NOT in git — they live on the workstation
+(<code>D:\optbot\artifacts\</code>, raw vault at <code>C:\Users\lilli\Downloads\API\API\Final\</code>).
+Griffin gives you machine or share access. <b>Rules:</b> never commit data files; run
+<code>python -m ruff check .</code> before pushing; branch from <code>develop</code>.</div>
+
+<h2>Part 1 — Day-1/2: spot-check the data yourself (the trust exercise)</h2>
+<p>Everything below has been machine-verified at population scale — your job is to attack it
+with fresh eyes and human judgment. If you break anything, you're a hero; if you can't,
+you'll <i>believe</i> the data, which you need for Part 2.</p>
+
+<h3>1A. Re-run the official-records audit yourself (30 min)</h3>
+<pre>cd D:\optbot
+python scripts\09_groundtruth_audit.py --per-season 5
+# downloads NHL official shift charts + play-by-play for 35 random games,
+# grades our windows: presence / events / bounds. Expect G2>=90%, G3>=95%, G4>=97%.</pre>
+
+<h3>1B. Hand-check ONE goal, end to end (the convincer — 45 min)</h3>
+<ol>
+<li>Pick any 2023-24 game you can find highlights for. Note a 5v5 goal and its clock time.</li>
+<li>Open the official record:
+<pre>python -c "import json; d=json.load(open(r'C:/Users/lilli/Downloads/API/API/Final/2023/raw/pbp_built_20232024/pbp_onice_GAMEPK.json')); [print(e['timeInPeriod'], e['details'].get('scoringPlayerId'), e['onice']) for e in d['events'] if e.get('type')=='goal']"</pre></li>
+<li>Open our window file: <code>D:\2023\final_windows\player_windows_train_GAMEPK_xg.csv</code> —
+find the window containing that second (<code>start_sec/end_sec</code> are game-elapsed).</li>
+<li>Verify: the rows with <code>GF&gt;0</code> are EXACTLY the on-ice skaters from step 2, and
+players who left before the goal (multi-shift windows) got <code>GF=0</code>.</li>
+<li>Cross-check TOI: official shifts in <code>...\csv\shiftcharts\shiftcharts_GAMEPK.csv</code>
+vs summed <code>seconds</code> per player in our file (within ~1s at window level).</li>
+</ol>
+
+<h3>1C. Spot-check MoneyPuck attachment (30 min)</h3>
+<pre>python -c "import pandas as pd; d=pd.read_parquet(r'D:\optbot\artifacts\mp_attach_2023\mp_shots_2023020500.parquet'); print(d[['shotID','window_id','t','xGoal','goal','shotRush']].head(15))"
+# every MoneyPuck shot -> our window, with the per-shot audit trail. Pick 3 shots,
+# confirm t falls inside the assigned window's [start_sec, end_sec] in the CSV above.</pre>
+
+<h3>1D. Try to break the priors (30 min)</h3>
+<pre>python scripts\13_lag_symmetry_audit.py --year 2022
+# proves every "prior" column predicts today and tomorrow equally (no future peeking).
+# The deliberate-leak control must scream (gap ~0.9); real columns must sit near 0.</pre>
+
+<h3>1E. Report back</h3>
+<p>One paragraph to Griffin: what you checked, anything that smelled wrong (file paths + numbers),
+and your personal verdict. Anything broken → we trace it together via the per-shot audit trail.</p>
+
+<h2>Part 2 — The build (your real job)</h2>
+
+<h3><span class="tag">P0</span> The Live Receipts Scoreboard — public, Supabase (deadline: before Sept seal)</h3>
+<p>The page where our sealed 2026-27 predictions get scored by reality, in public, all season.
+This is the company's shock-the-world artifact.</p>
+<table>
+<tr><th>Piece</th><th>Spec</th></tr>
+<tr><td>Input</td><td><code>artifacts/sealed_2026.json</code> — schema: <code>{player_id, dest_team,
+line_no, effective_date, pred_xgf_pct, band_lo, band_hi, achieved_coverage, scenario_hash}</code>
++ top-level <code>sha256_of_predictions</code>. Produced by <code>scripts/06_seal_predictions.py</code>.</td></tr>
+<tr><td>Supabase</td><td>tables: <code>predictions</code> (sealed rows, immutable),
+<code>actuals</code> (nightly upserts: gp_so_far, actual_xgf_pct), <code>meta</code> (hash, seal date).</td></tr>
+<tr><td>Scoring job</td><td>nightly cron: <code>scripts/06_seal_predictions.py --score</code> emits the
+actuals table (we'll wire a JSON output for you) → push to Supabase.</td></tr>
+<tr><td>Page</td><td>every call: player, team, predicted band, live actual, games played,
+inside-band ✓/✗, running coverage % vs the 80% promise, and the SHA-256 + seal date up top.
+Design vibe: sports-scoreboard honesty, not marketing gloss. Misses shown as plainly as hits —
+that IS the brand.</td></tr>
+</table>
+
+<h3><span class="tag">P1</span> The GM Demo app</h3>
+<p>Player → destination → line → projection card. Claude provides a local FastAPI endpoint
+(spec below) wrapping the working projection engine — you own everything above it.</p>
+<pre>POST /project  {player_id, dest_team, line_no, linemates?:[ids], as_of?:date}
+→ {xgf_pct, band:{lo,hi,achieved_coverage,extrapolated:bool},
+   env:{xgf60,xga60}, talent:{off,def,n_eff},
+   value_lines:{penalty_econ_g60, finishing_g100},
+   support:{tier, ok, detail}, scenario_hash}</pre>
+<p>Card shows: the % + band (with the coverage number — always), the two value lines,
+the support flag, and dropdowns to swap linemates / line — re-query on change.
+If <code>extrapolated</code> or <code>REFUSED_OOS</code>: show it loudly. Honesty is the UI's spine.</p>
+
+<h3><span class="tag">P2</span> The Trust Layer (your audit skills → product)</h3>
+<p>A "receipts" view behind every projection: the 860-move backtest table
+(<code>artifacts/backtest_final.parquet</code>), the calibration story, and the per-shot
+audit trail (<code>artifacts/mp_attach_*/mp_shots_*.parquet</code>: any shot → its window →
+the credited five). You spent Day 1 using these files to convince yourself; build the page
+that lets a GM's analyst do the same in three clicks.</p>
+
+<h2>Part 3 — Asset inventory (what exists, what's pending)</h2>
+<table>
+<tr><th>Asset</th><th>Where</th><th>Status</th></tr>
+<tr><td>Perfect Windows v3 (6.5M rows, 7 seasons)</td><td>artifacts/perfect_windows_v3.parquet</td><td class="ok">CERTIFIED</td></tr>
+<tr><td>Backtest results + conformal bands</td><td>artifacts/backtest_final.parquet, conformal_bands_final.json</td><td class="ok">LIVE (the −7.6%)</td></tr>
+<tr><td>MP per-shot attachments (8 seasons)</td><td>artifacts/mp_attach_*/</td><td class="ok">99.86% match</td></tr>
+<tr><td>Talent + shot-personality cards (13,708)</td><td>artifacts/talent_asof.parquet, shot_profiles.parquet</td><td class="ok">sniff-passed</td></tr>
+<tr><td>Member shells + coach table</td><td>artifacts/member_shells.parquet, coach_table.parquet</td><td class="warn">coach 2025-26 partial (rebuild queued)</td></tr>
+<tr><td>Trainer surface + member bio join</td><td>script 21 (queued)</td><td class="warn">Claude's next build</td></tr>
+<tr><td>Neural phases (tower/trunk)</td><td>optbot/models/</td><td class="warn">coded, awaiting GPU — does NOT block you</td></tr>
+<tr><td>Sealed predictions</td><td>artifacts/sealed_2026.json</td><td class="warn">September — your P0 must be ready first</td></tr>
+</table>
+
+<h2>Part 4 — Repo tour (10-minute orientation)</h2>
+<table>
+<tr><th>Read</th><th>Why</th></tr>
+<tr><td><code>README.md</code></td><td>the whitepaper: results, 22-threat causal register, certifications</td></tr>
+<tr><td><code>docs/ARCHITECTURE_PLAN.md</code></td><td>canonical A/B/C design + gates (v2.2)</td></tr>
+<tr><td><code>docs/cin_paper.pdf</code></td><td>the academic version, if you want depth</td></tr>
+<tr><td><code>optbot/contracts/</code></td><td>the data laws — schema + feature legality (banned lists cite evidence)</td></tr>
+<tr><td><code>scripts/00–20</code></td><td>numbered pipeline; every number in every doc regenerates from these</td></tr>
+<tr><td><code>vendor/window_engine/</code></td><td>the certified upstream builder + its regression-gate README</td></tr>
+</table>
+
+<div class="box"><b>The one cultural rule:</b> this project got here by treating every "it's probably fine"
+as a bug report. If anything — a number, a join, a UI copy claim — smells off, say so immediately.
+Every fatal bug we found was caught by exactly that instinct, and two of them made the headline
+number BETTER. Welcome to the team. 🏒</div>
+
+</body>
+</html>
