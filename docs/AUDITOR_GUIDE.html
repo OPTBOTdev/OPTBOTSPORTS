@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OptBot — The Auditor's Field Guide</title>
+<style>
+  :root { --navy:#16294A; --red:#D7263D; --ice:#EDF3FB; }
+  body { font-family:'Segoe UI',system-ui,sans-serif; color:#222; max-width:940px; margin:0 auto; padding:24px; line-height:1.55; }
+  h1 { color:var(--navy); font-size:25px; border-bottom:3px solid var(--red); padding-bottom:8px; }
+  h2 { color:var(--navy); font-size:19px; margin-top:34px; }
+  h3 { color:var(--red); font-size:15px; margin-top:20px; }
+  code, pre { background:var(--ice); border-radius:6px; font-family:Consolas,monospace; font-size:12.5px; }
+  code { padding:1px 6px; } pre { padding:11px; overflow-x:auto; border:1px solid #d6e2f2; }
+  table { border-collapse:collapse; width:100%; font-size:13px; margin:10px 0; }
+  th { background:var(--navy); color:#fff; text-align:left; padding:6px 8px; }
+  td { border:1px solid #d6e2f2; padding:5px 8px; vertical-align:top; }
+  tr:nth-child(even) td { background:var(--ice); }
+  .box { background:var(--ice); border:1px solid #c9d6e8; border-radius:10px; padding:13px 17px; margin:13px 0; }
+  .g { color:#2E7D32; font-weight:600; }
+</style>
+</head>
+<body>
+
+<h1>The Auditor's Field Guide</h1>
+<p>Everything you need to audit this system with your own hands: where the truth lives,
+what a "window" is, what every feature means and where it's computed, and exactly how to
+run the six checks. Written so you never have to guess.</p>
+
+<h2>1. The source-of-truth ladder (audit DOWN the ladder, trust UP it)</h2>
+<table>
+<tr><th>Rank</th><th>Dataset</th><th>Path (example)</th><th>What it is</th></tr>
+<tr><td>1 🥇</td><td><b>pbp_onice</b> — THE source of truth</td>
+<td><code>C:\Users\lilli\Downloads\API\API\Final\2023\raw\pbp_built_20232024\pbp_onice_2023020500.json</code></td>
+<td>Every game event (goal, shot, hit, faceoff, shift change) with the exact second
+(<code>sec_game</code>) AND the full list of who was on the ice at that moment. When any two
+numbers disagree, THIS file wins.</td></tr>
+<tr><td>2</td><td>Official shift charts</td>
+<td><code>...\Final\2023\csv\shiftcharts\shiftcharts_2023020500.csv</code></td>
+<td>NHL's per-player shift intervals (period, start, end). Independent check on who-was-on-when.</td></tr>
+<tr><td>3</td><td>Raw pbp + boxscore</td><td><code>...\raw\pbp\2023020500.json</code>, <code>...\raw\boxscore\...</code></td>
+<td>league play-by-play (349 plays/game) and rosters.</td></tr>
+<tr><td>4</td><td>MoneyPuck shots</td><td><code>D:\shots_2023.csv</code> (and <code>D:\shots_2007-2024.zip</code>)</td>
+<td>independent per-shot dataset incl. xGoal — our licensed xG + external referee.</td></tr>
+<tr><td>5</td><td><b>Windows</b> (derived)</td><td><code>D:\2023\final_windows\player_windows_train_2023020500_xg.csv</code></td>
+<td>what the models actually eat — one row per (player, game-segment). Section 2 explains it.</td></tr>
+<tr><td>6</td><td>Artifacts (assembled)</td><td><code>D:\optbot\artifacts\*.parquet</code></td>
+<td>joined training tables, priors, backtests. Built by the numbered scripts (Section 3).</td></tr>
+</table>
+<div class="box"><b>Your core auditing move, always:</b> pick a claim in a rank-5/6 file →
+walk it DOWN to rank-1 → confirm the pbp agrees. If it does 20 times out of 20 on things
+YOU picked, the derivation is honest.</div>
+
+<h2>2. The Window Key — what a "window" actually is</h2>
+<p><b>A window = one continuous slice of game time</b> (median ~43 seconds, whistle-ish
+boundaries, same manpower throughout — a goal or penalty always ENDS a window). Players can
+change on the fly inside one. The file gives <b>one row per player per window</b> — his view
+of that slice.</p>
+<table>
+<tr><th>Column</th><th>Plain meaning</th><th>Gotchas you must know</th></tr>
+<tr><td><code>window_id</code></td><td>slice ID within the game</td><td>—</td></tr>
+<tr><td><code>start_sec / end_sec</code></td><td>slice boundaries</td><td><b>GAME-elapsed seconds</b> (period 2 spans 1200–2400) — NOT period clock</td></tr>
+<tr><td><code>seconds</code></td><td>how long THIS player was on ice within the slice</td><td>often &lt; window length — players flow through; verified 99.7% exact vs official shifts</td></tr>
+<tr><td><code>strength_global</code></td><td>manpower state</td><td>labels drift across files: <code>5v5</code> vs <code>5V5_5v5</code> — always normalize; only {5v5, PP, PK} exist (no 4v4/OT/EN by design)</td></tr>
+<tr><td><code>xGF / xGA / GF / GA / SF / SA</code></td><td>on-ice events FOR/AGAINST <b>during his seconds only</b></td><td>attribution audited: goals credit ONLY players on ice at the goal second (100% in 59,807 tricky cases)</td></tr>
+<tr><td><code>hits_personal, giveaways_committed, takeaways_forced, blocks_personal</code></td><td>things HE did in the slice</td><td>verified 100.00% vs pbp on 754k checks</td></tr>
+<tr><td><code>teammates_onice_ids_w / _sec_w</code></td><td>who he shared ice with + overlap seconds (pipe-separated)</td><td><b>NOT sorted</b> in the raw CSV — our extraction sorts by seconds; never take "first 3"</td></tr>
+<tr><td><code>entered_after_start, entry_offset_s</code></td><td>did he jump on mid-slice, and when</td><td>entry timing is legal context; EXIT timing is banned (leaving early is often CAUSED by what happened)</td></tr>
+<tr><td>files ending <code>_xg.csv</code></td><td>= xG-filled version</td><td>always audit the <code>_xg</code> file; skip anything with "backup" in the name</td></tr>
+</table>
+
+<h2>3. Script index (what builds what)</h2>
+<table>
+<tr><th>Script</th><th>One-liner</th></tr>
+<tr><td><code>vendor/window_engine/perfect_windows.py</code></td><td>THE window builder (raw pbp_onice → window CSVs). Certified.</td></tr>
+<tr><td><code>vendor/window_engine/build_pbp_with_onice.py</code></td><td>merges raw pbp + shifts + boxscore → pbp_onice (rank-1 truth files)</td></tr>
+<tr><td><code>scripts/00–00c</code></td><td>dataset validation gate + the historical repairs (dedupe, actuals rebuild)</td></tr>
+<tr><td><code>scripts/01–02</code></td><td>trade/UFA ledger · talent prior (decayed, league-demeaned residuals, shrunk)</td></tr>
+<tr><td><code>scripts/02b–02d</code></td><td>line slots · people/outcome extraction from windows · assembled table joins</td></tr>
+<tr><td><code>scripts/03–06</code></td><td>Marcel baseline · demo projection CLI · THE backtest · sealed predictions</td></tr>
+<tr><td><code>scripts/09</code></td><td>audit vs NHL API official records (presence/events/bounds grades)</td></tr>
+<tr><td><code>scripts/10, 12</code></td><td>full-season audits vs local truth: seconds, multistint, event microscope</td></tr>
+<tr><td><code>scripts/13</code></td><td><b>the lag lie-detector</b> (prediction-symmetry test) — your check #3 tool</td></tr>
+<tr><td><code>scripts/14</code></td><td>MoneyPuck per-shot attachment (with boundary rule + audit trail)</td></tr>
+<tr><td><code>scripts/15</code></td><td>shooting-personality cards (13,708 player-seasons, 2007–2025)</td></tr>
+<tr><td><code>scripts/16, 18</code></td><td>Perfect Windows v3 assembly + battery · the extended final backtest</td></tr>
+<tr><td><code>scripts/20</code></td><td>member shells (teammate form/settling) + coach table</td></tr>
+</table>
+
+<h2>4. THE FEATURE KEY — every model input, in plain English, with its birthplace</h2>
+<p>This is your audit checklist's row list. "Computed in" = where you go to review the math.</p>
+
+<h3>People block (per teammate & opponent on the ice, up to 5 each)</h3>
+<table>
+<tr><th>Feature</th><th>Plain meaning</th><th>Computed in</th><th>Ultimate source</th></tr>
+<tr><td>static ID vector</td><td>learned "who he is as a linemate" (not audit-able as data — audited via probes)</td><td>trainer (GPU, pending)</td><td>—</td></tr>
+<tr><td>age at game date</td><td>his age that night</td><td>bio join (PENDING — being built)</td><td>birthdate tables (<code>D:\&lt;yr&gt;\...bodies_*.csv</code>, API player pages)</td></tr>
+<tr><td>position, handedness</td><td>F/D, L/R shot</td><td>same bio join</td><td>boxscore rosters / bodies tables</td></tr>
+<tr><td>form_prior_xgf60 (+ xga)</td><td>his on-ice results in PRIOR seasons only (never the current one — that's the anti-echo rule)</td><td><code>scripts/20</code></td><td><code>artifacts/mp_playergame.parquet</code> ← script 18 ← MP shots + windows</td></tr>
+<tr><td>form_neff</td><td>how much evidence behind that form number</td><td><code>scripts/20</code></td><td>same</td></tr>
+<tr><td>member_gsc</td><td>games since HIS last team change (is he settled?)</td><td><code>scripts/20</code></td><td>team transitions in mp_playergame</td></tr>
+<tr><td>co-presence seconds</td><td>how long he shared ice with the focal player — used as a WEIGHT only, never a feature</td><td>window CSVs</td><td>pbp_onice / shifts</td></tr>
+</table>
+
+<h3>Context block (the situation)</h3>
+<table>
+<tr><th>Feature</th><th>Plain meaning</th><th>Computed in</th><th>Ultimate source</th></tr>
+<tr><td>score bucket</td><td>up/down/tied at slice start</td><td>window builder</td><td>pbp goals before the slice</td></tr>
+<tr><td>zone start, faceoff loc</td><td>where the slice began (note: info fades in ~20s — measured)</td><td>window builder</td><td>pbp faceoffs</td></tr>
+<tr><td>period, time bucket, start regime</td><td>when + how the slice began (faceoff vs on-the-fly)</td><td>window builder</td><td>pbp</td></tr>
+<tr><td>manpower, rink, home/away</td><td>strength state, arena, venue side</td><td>window builder</td><td>pbp/boxscore</td></tr>
+<tr><td>rest days, back-to-back</td><td>schedule fatigue</td><td>window builder</td><td>schedule files</td></tr>
+<tr><td>entry mode + offsets</td><td>thrown on mid-play vs started at faceoff (worth +12% xGF/60 — measured)</td><td>window builder</td><td>shift timing in pbp_onice</td></tr>
+<tr><td>team priors (xGF/xGA/pace ×2 teams)</td><td>each team's recent quality ENTERING that game (lagged)</td><td>legacy prior builders (audited LOSO/lagged)</td><td><code>D:\combined_player_windows...parquet</code> spine cols</td></tr>
+<tr><td>goalie tier + GSAA (both)</td><td>how good each goalie has been, entering the game</td><td>legacy goalie priors</td><td>spine cols</td></tr>
+<tr><td>focal games_since_team_change</td><td>the settling-in curve — game 3 vs game 33 with new team</td><td><code>optbot/data/build_perfect_windows.py</code></td><td>team transitions</td></tr>
+<tr><td>coach_id + tenure</td><td>who's behind the bench, how long</td><td><code>scripts/20</code></td><td><code>Downloads\API\artifacts\game_coach_ids_2017_2025.csv</code> (⚠ 2025-26 partial — rebuild queued)</td></tr>
+</table>
+
+<h3>Also flowing to the model (not tower inputs)</h3>
+<table>
+<tr><th>Item</th><th>Meaning</th><th>Computed in</th></tr>
+<tr><td>talent scalars (focal)</td><td>how much he beats his circumstances — career, decayed, shrunk</td><td><code>optbot/priors/talent.py</code> via script 02</td></tr>
+<tr><td>mp_xgf/mp_xga + rush/rebound/chaos splits</td><td>TARGETS (what we predict) — MoneyPuck xG credited to on-ice players</td><td><code>scripts/14 + 16</code></td></tr>
+<tr><td>seconds/duration</td><td>loss weights & exposure offsets ONLY — banned as inputs (window length is partly CAUSED by outcomes; we measured +51% distortion if you ignore this)</td><td>—</td></tr>
+</table>
+
+<h2>5. The six checks — plain English + the exact move</h2>
+
+<h3>Check 1 · Source &amp; lineage — "where did this number come from?"</h3>
+<p>Like tracing a steak to the farm. Use Section 4's "computed in" column, open that script,
+find the lines, confirm the chain reaches a rank-1/2/4 source. <b>Move:</b> fill "path
+verified ✓" or flag "can't trace" per feature.</p>
+
+<h3>Check 2 · Coverage — "is it filled in, and what happens when it isn't?"</h3>
+<pre>python -c "import pandas as pd; d=pd.read_parquet(r'D:\optbot\artifacts\member_shells.parquet'); print(d.groupby(d.gamePk//1000000).apply(lambda g: g.form_prior_xgf60.isna().mean().round(3)))"</pre>
+<p>Blanks are often CORRECT (rookies have no prior seasons!) — the failure is a blank with
+no written rule. <b>Move:</b> record %-missing per season + the stated impute/flag policy.
+No policy = red flag.</p>
+
+<h3>Check 3 · Lag proof — "does it secretly know the future?"</h3>
+<p>An honest yesterday-stat predicts today and tomorrow EQUALLY (it can't know anything
+special about today). A leaky one predicts today way better. Script 13 measures exactly
+that, with a planted cheater as the control (the cheater screams ~0.9; honest columns sit
+near 0.00).</p>
+<pre>python scripts\13_lag_symmetry_audit.py --year 2022</pre>
+<p><b>Move:</b> confirm every feature appears in the output with gap &lt; 0.02; any new
+column you can't find there → extend the test to it (ask Claude for the 3-line pattern).</p>
+
+<h3>Check 4 · Legality — "could we know this BEFORE the prediction moment?"</h3>
+<p>The product is "pretend it's trade day — predict." So ask, per feature: <i>if a GM asks
+about a move that hasn't happened, can we produce this value?</i> Yes exactly (coach,
+schedule) → legal. Yes as a historical average (typical fatigue in that slot) → legal-as-
+distribution. Only knowable after play happens (shots in the window, when he left the ice)
+→ BANNED. <b>Move:</b> your classification must match
+<code>optbot/contracts/tower_schema.py</code>; disagreements → escalate, don't silently fix —
+your disagreement might be the bug catch.</p>
+
+<h3>Check 5 · Stability — "does it behave the same every season?"</h3>
+<pre>python -c "import pandas as pd; d=pd.read_parquet(r'D:\optbot\artifacts\perfect_windows_v3.parquet', columns=['season','team_xgf60_prior_ev']); print(d.groupby('season').team_xgf60_prior_ev.agg(['mean','std']).round(3))"</pre>
+<p>You want a boring flat-ish line. A sudden jump in one season is almost never hockey —
+it's a pipeline change (unit switch, broken join). <b>Move:</b> eyeball mean/std per season
+per feature; investigate any jump &gt;~20% with no known cause.</p>
+
+<h3>Check 6 · Serving parity — "can the live product actually FETCH this at query time?"</h3>
+<p>Classic ML death: features that exist in training files but can't be computed when a
+customer clicks — the live model then runs on a different diet than it trained on.
+<b>Move:</b> for each feature, answer "when the demo asks about a hypothetical trade next
+week, where does this value come from?" If the answer is "…it can't" → flag train-only,
+keep out of the model. Sanity aid: <code>scripts/04_project_trades.py</code> is the serving
+path — a feature with no representation there deserves suspicion.</p>
+
+<h2>6. Your deliverable</h2>
+<p><code>docs/feature_audit_sheet.md</code>: one row per feature from Section 4 · six verdict
+columns · date + your name. When complete, we hold a document that says <i>"every ingredient
+independently audited by a second engineer"</i> — a sentence that wins diligence meetings
+on its own.</p>
+
+<div class="box"><b>If anything disagrees with the pbp — the rank-1 truth — you've found
+something important.</b> Every major bug in this project's history was caught by exactly
+that comparison. Bring paths + numbers; we trace it together through the per-shot audit
+trail. 🏒</div>
+
+</body>
+</html>
