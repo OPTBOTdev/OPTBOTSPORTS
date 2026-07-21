@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OptBot — The Phases, in Plain Language (and what's MVP)</title>
+<style>
+  :root { --navy:#16294A; --red:#D7263D; --ice:#EDF3FB; }
+  body { font-family:'Segoe UI',system-ui,sans-serif; color:#222; max-width:920px; margin:0 auto; padding:24px; line-height:1.55; }
+  h1 { color:var(--navy); font-size:24px; border-bottom:3px solid var(--red); padding-bottom:8px; }
+  h2 { color:var(--navy); font-size:19px; margin-top:32px; }
+  h3 { color:var(--red); font-size:15px; margin-top:18px; }
+  code { background:var(--ice); border-radius:6px; font-family:Consolas,monospace; font-size:12.5px; padding:1px 6px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; margin:10px 0; }
+  th { background:var(--navy); color:#fff; text-align:left; padding:6px 8px; }
+  td { border:1px solid #d6e2f2; padding:5px 8px; vertical-align:top; }
+  tr:nth-child(even) td { background:var(--ice); }
+  .box { background:var(--ice); border:1px solid #c9d6e8; border-radius:10px; padding:13px 17px; margin:13px 0; }
+  .mvp { color:#2E7D32; font-weight:700; } .post { color:#B26A00; font-weight:700; } .no { color:#888; font-weight:600; }
+</style>
+</head>
+<body>
+
+<h1>The Phases, in Plain Language — and what counts as MVP</h1>
+<p>Read this so every audit decision you make connects to WHAT we're shipping and WHEN.
+The product: <i>"tell an NHL team what a player becomes on THEIR team, before he plays
+there — with honest error bars."</i> Everything below serves that one sentence.</p>
+
+<div class="box"><b>What MVP means here (ships October):</b> (1) the projection engine —
+today that's <b>v0</b> (already beats the industry by 7.6%; no neural net), hopefully
+upgraded to <b>v1</b> (the trained Phase A+B) if it wins the shootout; (2) <b>sealed
+predictions</b> for every 2026-27 mover, hash-locked in September; (3) your <b>public
+scoreboard + demo</b>. <u>The MVP triage rule you'll use constantly:</u> does this thing
+change the October number, the demo, or the scoreboard? If not, it's post-MVP no matter
+how cool it is.</div>
+
+<h2>PHASE A — the Environment Tower &nbsp;<small>("describe the ice around him")</small></h2>
+<p><b>The point:</b> a player's stats are half him, half his surroundings. Phase A is a
+small neural network whose ONLY job is turning "who and what surrounds a player"
+into one number-vector the rest of the system can use — so when we swap the surroundings
+(new team!), the prediction actually knows what changed. Today's v0 uses a crude average
+("a typical 2nd-line environment"); Phase A replaces that with the SPECIFIC humans and
+situation.</p>
+<p><b>Data it eats:</b> the windows (Section 2 of the <a href="AUDITOR_GUIDE.html">Field
+Guide</a>) + the member shells + coach table + team priors. <b>Status:</b> coded, awaiting
+GPU. <b>MVP:</b> yes IF it beats v0 in the harness; v0 ships otherwise.</p>
+<table>
+<tr><th>Feature</th><th>What it's DOING in Phase A (its job)</th></tr>
+<tr><td>teammate IDs (learned vectors)</td><td>"who's beside him" — the single biggest environmental fact; McDavid-as-linemate ≠ generic linemate</td></tr>
+<tr><td>teammate shells (age, form, settling)</td><td>"which VERSION of that guy" — 2019-Kane vs 2025-Kane are different linemates; the shell keeps vectors current</td></tr>
+<tr><td>opponent IDs + shells</td><td>"who he's up against" — competition difficulty, learned from identities not a summary stat</td></tr>
+<tr><td>score / zone-start / period / entry-mode</td><td>"the game situation" — trailing teams attack more; on-the-fly entries start in better spots (+12%, measured)</td></tr>
+<tr><td>team priors (pace, xG rates, goalie)</td><td>"everything NOT on the ice" — the bench's depth, the system's tempo, the goalie behind them</td></tr>
+<tr><td>coach id + tenure</td><td>"the system designer" — scheme effects beyond the roster</td></tr>
+<tr><td>games-since-team-change (his AND each member's)</td><td>"is anyone still settling in?" — new arrivals play differently for a few weeks; we model the curve instead of being fooled by it</td></tr>
+<tr><td>rest / back-to-back / rink</td><td>fatigue + venue effects (incl. scorekeeper quirks we've measured)</td></tr>
+<tr><td><b>the focal player: NOTHING</b></td><td>deliberately absent — if the environment encoder knew WHO he is, "swap the environment" would be contaminated. His info arrives in Phase B via a separate pipe</td></tr>
+</table>
+
+<h2>PHASE B — the Combiner &nbsp;<small>("player + environment + coach's knobs → prediction")</small></h2>
+<p><b>The point:</b> take three separate pipes — the environment (from A), the player's
+talent (from C), and the coach's deployment knobs (zone starts, matchup exposure) — and
+combine them into predicted outcomes. The pipes are kept physically separate inside the
+network so "how good he is" can never get tangled with "how he was used" — that separation
+IS the company's core trick.</p>
+<p><b>Data it eats:</b> A's output + C's talent numbers + the 17 lever columns + bio;
+trains against MoneyPuck xG targets on 6.5M windows. <b>Status:</b> coded, awaiting GPU.
+<b>MVP:</b> same deal as A — ships only if it beats v0.</p>
+<table>
+<tr><th>Input</th><th>Its job in Phase B</th></tr>
+<tr><td>h_env (from A)</td><td>the situation, summarized</td></tr>
+<tr><td>talent channel (from C)</td><td>the player — HOW GOOD, arriving pre-computed and untouchable</td></tr>
+<tr><td>17 levers</td><td>the coach's controllable knobs — lets us later answer "what if we used him differently"</td></tr>
+<tr><td>bio / age</td><td>explicit aging, so it transfers to players the model never saw</td></tr>
+<tr><td>targets: MP xG (+ rush/rebound/chaos splits)</td><td>what "success" means during training — one licensed ruler end to end</td></tr>
+</table>
+
+<h2>PHASE C — the Player Side &nbsp;<small>("who IS he, separated from where he played")</small></h2>
+<p><b>The point:</b> measure each player's true contribution by comparing what he produced
+to what an average player would've produced in his exact situations — career-long,
+recent-games-weighted, pulled toward average when evidence is thin. This number is
+already computed for everyone and <b>is the engine of the proven 7.6%</b>. Later (v2),
+it grows a "style" dimension (HOW he produces: rush sniper vs net-front vs point bomber
+— we've pre-computed 13,708 shooting-personality cards for this) which, combined with
+Phase A's people-vectors, becomes the chemistry/fit engine.</p>
+<table>
+<tr><th>Piece</th><th>Its job</th><th>MVP?</th></tr>
+<tr><td>talent scalars (off/def)</td><td>how much he moves the needle, anywhere</td><td class="mvp">MVP — live now</td></tr>
+<tr><td>penalty economy</td><td>hidden value of drawing/avoiding penalties (invisible at 5v5)</td><td class="mvp">MVP — built &amp; validated</td></tr>
+<tr><td>finishing economy + age delta</td><td>goals-above-chances skill · aging adjustment</td><td class="mvp">MVP-cheap (computed layers, days)</td></tr>
+<tr><td>style vector + chemistry</td><td>who fits with whom</td><td class="post">v2 — after A+B prove out</td></tr>
+</table>
+
+<h2>The 1B candidate features — MVP or not (the triage you own)</h2>
+<p>For each "missing feature" candidate: which phase would eat it, and the honest verdict
+against the MVP rule ("does it change the October number, demo, or scoreboard?").</p>
+<table>
+<tr><th>Candidate</th><th>Would feed</th><th>Verdict</th><th>Why</th></tr>
+<tr><td>Projected lines &amp; scratches (Daily Faceoff)</td><td>Scenario builder</td>
+<td class="mvp">MVP — YES, lightweight</td><td>September's sealed predictions need a line
+assignment for ~60 movers; real projected lines beat our TOI-rank guess. Even a manual
+pull for those 60 helps the October number directly.</td></tr>
+<tr><td>Injury/absence spells (derivable from our own gaps)</td><td>C (talent context), scoreboard notes</td>
+<td class="post">POST-MVP (cheap, park high)</td><td>bands already price it; nice explainer
+("missed 20 games") for the scoreboard later.</td></tr>
+<tr><td>Referee assignments (already in our boxscores)</td><td>penalty economy v1.1</td>
+<td class="post">POST-MVP</td><td>refines a value line, not the headline.</td></tr>
+<tr><td>Travel / time zones (computable offline)</td><td>A (context)</td>
+<td class="post">POST-MVP</td><td>marginal next to rest/b2b we already have.</td></tr>
+<tr><td>Contract year / cap (PuckPedia)</td><td>C + threat register (T5)</td>
+<td class="post">POST-MVP research</td><td>motivation confound — interesting, unproven, not October.</td></tr>
+<tr><td>Draft pedigree (NHL API)</td><td>C (rookie priors)</td>
+<td class="post">POST-MVP</td><td>helps the widest bands (rookies) — few rookies in the move ledger.</td></tr>
+<tr><td>NHL EDGE tracking</td><td>C v2 style</td><td class="post">v2</td><td>style-vector fuel.</td></tr>
+<tr><td>AHL/OHL player stats (HockeyTech)</td><td>the future recruiting product</td>
+<td class="post">POST-MVP but STRATEGIC</td><td>doesn't touch October's number — but it's the
+expansion pitch; escalate if a team meeting demands a teaser.</td></tr>
+<tr><td>Defensive style signals</td><td>C v2</td><td class="post">v2</td><td>research question first.</td></tr>
+</table>
+
+<div class="box"><b>How to use this page:</b> when your 1B investigation surfaces a NEW
+candidate (you will find things we haven't thought of — that's the job), place it in this
+table yourself: which phase would eat it → does it move October → verdict + evidence.
+Bring that row to the weekly; if it's MVP-grade, it jumps the queue same week.</div>
+
+</body>
+</html>
