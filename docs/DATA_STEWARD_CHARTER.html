@@ -3,162 +3,79 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OptBot — Data Assurance & Product Surfaces: Role Charter</title>
+<title>OptBot — Feature &amp; Data Audit: Role Brief</title>
 <style>
-  :root { --navy:#16294A; --red:#D7263D; --ice:#EDF3FB; --gray:#5B6B82; }
+  :root { --navy:#16294A; --red:#D7263D; --ice:#EDF3FB; }
   body { font-family:'Segoe UI',system-ui,sans-serif; color:#222; max-width:900px; margin:0 auto; padding:24px; line-height:1.55; }
-  h1 { color:var(--navy); font-size:25px; border-bottom:3px solid var(--red); padding-bottom:8px; }
-  h2 { color:var(--navy); font-size:19px; margin-top:34px; }
-  h3 { color:var(--red); font-size:15px; margin-top:20px; }
-  code, pre { background:var(--ice); border-radius:6px; font-family:Consolas,monospace; font-size:13px; }
-  code { padding:1px 6px; } pre { padding:12px; overflow-x:auto; border:1px solid #d6e2f2; }
+  h1 { color:var(--navy); font-size:24px; border-bottom:3px solid var(--red); padding-bottom:8px; }
+  h2 { color:var(--navy); font-size:19px; margin-top:32px; }
+  code { background:var(--ice); border-radius:6px; font-family:Consolas,monospace; font-size:12.5px; padding:1px 6px; }
   table { border-collapse:collapse; width:100%; font-size:13.5px; margin:10px 0; }
   th { background:var(--navy); color:#fff; text-align:left; padding:7px 9px; }
   td { border:1px solid #d6e2f2; padding:6px 9px; vertical-align:top; }
   tr:nth-child(even) td { background:var(--ice); }
   .box { background:var(--ice); border:1px solid #c9d6e8; border-radius:10px; padding:14px 18px; margin:14px 0; }
-  .duty { border-left:5px solid var(--red); padding-left:14px; margin:20px 0; }
-  li { margin:4px 0; }
 </style>
 </head>
 <body>
 
-<h1>Role Charter — Data Assurance &amp; Product Surfaces</h1>
-<p><b>Mission of the role:</b> while Griffin builds and trains the models, YOU own two things:
-(1) <b>the truth of every number that enters or leaves the system</b> — features, data,
-confounders — and (2) <b>the surfaces that show that truth to the world</b>. The model can
-only be as honest as the data steward. That's you.</p>
+<h1>Feature &amp; Data Audit — Role Brief</h1>
+<p><b>Your job in one sentence:</b> verify every number our models eat, and evaluate the
+numbers we DON'T have yet — how easy to get, and whether they matter for the MVP.</p>
 
-<div class="box"><b>Context in one line:</b> the system beats the industry projection by 7.6%
-on 860 frozen-clock historical moves with 80.0% measured band coverage — every claim
-regenerable from numbered scripts in this repo. Read <code>README.md</code> (the whitepaper)
-and <code>docs/ARCHITECTURE_PLAN.md</code> first. Onboarding exercises:
-<code>docs/HANDOFF.html</code> Part 1 — do those before anything below.</div>
+<div class="box"><b>Context:</b> the system already beats the industry projection by 7.6%
+on 860 historical moves, with error bars measured at 80.0% accuracy. <b>The MVP bar:</b>
+enough proof to land a partnership with an NHL team or seed funding — that's it. Not
+perfection; provable credibility. Your work is a direct part of that proof ("every
+feature independently audited by a second engineer" is a sentence that closes meetings).
+<br><br><b>Your two manuals (keep these files in the same folder as this one, or open
+them from the repo <code>docs/</code>):</b><br>
+📖 <a href="AUDITOR_GUIDE.html">AUDITOR_GUIDE.html</a> — datasets &amp; paths (pbp = source
+of truth), the Window Key, the script index, the Feature Key, and each check below in
+plain English with a copy-paste command.<br>
+📖 <a href="PHASES_EXPLAINED.html">PHASES_EXPLAINED.html</a> — what Phases A/B/C do in
+plain language, what each feature's job is, and the MVP triage rule.</div>
 
-<h2>DUTY 1 — Own the Feature Manifest (the audit you asked "is it enough?" — no, here's beyond)</h2>
-<div class="duty">
-<p>Every feature the models consume lives in <code>optbot/contracts/tower_schema.py</code> and
-the manifest in <code>docs/ARCHITECTURE_PLAN.md</code>. You are its auditor of record.</p>
-
-<h3>1A. Verify every existing feature (the full sweep, ~week 1-2)</h3>
-<div class="box"><b>📖 Your day-to-day manual for this duty is the
-<a href="AUDITOR_GUIDE.html">Auditor's Field Guide</a></b> (same folder / repo docs/).
-It contains everything 1A needs: the source-of-truth ladder with real dataset paths
-(pbp_onice = rank-1 truth), the Window Key (every column explained + gotchas), the full
-script index, <b>THE FEATURE KEY</b> (every model input in plain English with the script
-that computes it and its raw source — your audit sheet's row list), and each check below
-rewritten in plain English with an exact copy-paste command. Read it before starting;
-keep it open while working.</div>
-<p>For EVERY manifest column, produce one row in a living audit sheet:</p>
+<h2>Task 1 — Audit every existing feature (the sweep)</h2>
+<p>One row per feature (the row list = the Feature Key in the Auditor Guide), six checks each:</p>
 <table>
-<tr><th>Check</th><th>How</th><th>Pass bar</th></tr>
-<tr><td>Source &amp; lineage</td><td>trace to the producing script + raw source</td><td>documented path, no orphans</td></tr>
-<tr><td>Coverage</td><td>% non-null per season (watch 2019-20 and 2025-26)</td><td>&gt;95% or an explicit UNK/impute policy</td></tr>
-<tr><td>Lag proof</td><td>run <code>scripts/13_lag_symmetry_audit.py</code> extended to the column</td><td>gap &lt; 0.02 vs ~0.9 leak control</td></tr>
-<tr><td>Legality</td><td>classify SYNTH / MARG / BANNED per the scenario-builder litmus test
-("can it be reconstructed for a hypothetical at t0?")</td><td>matches tower_schema; disputes escalated</td></tr>
-<tr><td>Distribution stability</td><td>per-season mean/std drift plot</td><td>no unexplained jumps (a jump = a pipeline change = investigate)</td></tr>
-<tr><td>Serving parity</td><td>can the demo/scenario ACTUALLY produce this value at query time?</td><td>yes, or it's flagged train-only</td></tr>
+<tr><th>Check</th><th>Plain meaning</th><th>Pass bar</th></tr>
+<tr><td>1. Source</td><td>trace the number to the script that makes it and the raw file it came from</td><td>documented chain, ends at pbp/shifts/MoneyPuck</td></tr>
+<tr><td>2. Coverage</td><td>how often is it blank, per season — and is there a written rule for blanks</td><td>&gt;95% filled OR an explicit blank-handling rule</td></tr>
+<tr><td>3. No future peeking</td><td>an honest past-stat predicts today and tomorrow equally; a leaky one predicts today better — script 13 measures this</td><td>gap &lt; 0.02 (the planted cheater scores ~0.9)</td></tr>
+<tr><td>4. Knowable at prediction time</td><td>could we produce this value on trade day, for a hypothetical?</td><td>classification matches <code>tower_schema.py</code>; disagreements = escalate (your disagreement may be the catch)</td></tr>
+<tr><td>5. Stable across seasons</td><td>plot the average per season — should be boring; a jump = a pipeline bug wearing a trend costume</td><td>no unexplained &gt;20% jumps</td></tr>
+<tr><td>6. Live-product parity</td><td>can the demo actually FETCH this value when a customer clicks?</td><td>yes, or flagged train-only</td></tr>
 </table>
-<p><b>Deliverable:</b> <code>docs/feature_audit_sheet.md</code> — one row per feature, verdicts,
-dated. This becomes a diligence artifact ("every feature independently audited by a second
-engineer").</p>
+<p><b>Deliverable:</b> <code>docs/feature_audit_sheet.md</code> — one row per feature, six
+verdicts, dated, your name on it.</p>
 
-<h3>1B. The sufficiency review — features we DON'T have (go beyond)</h3>
-<div class="box"><b>📖 Required context for this duty:
-<a href="PHASES_EXPLAINED.html">The Phases, in Plain Language</a></b> — what Phases A/B/C
-each DO (in plain English), what data each eats, what job every feature performs inside its
-phase, what "MVP" concretely means (the October number + demo + scoreboard), and the
-MVP-or-not triage verdicts for every candidate below — plus the rule for triaging NEW
-candidates you discover yourself. Judge every sufficiency question against that page.</div>
-<p>Standing question you own: <i>"what measurable thing about hockey are we blind to?"</i>
-Investigate each candidate below: does public data exist, what's the quality, what would
-ingestion cost. Recommend BUILD / PARK / REJECT with evidence. Current candidate ledger:</p>
+<h2>Task 2 — Evaluate the extra columns (how easy · is it MVP)</h2>
+<p>For each candidate below (full context + phase-by-phase reasoning in
+<a href="PHASES_EXPLAINED.html">PHASES_EXPLAINED.html</a>): investigate the source, estimate
+the effort honestly, and give a verdict against the MVP bar (<i>does it strengthen the
+proof that lands a team partnership or funding?</i>). Recommend BUILD / PARK / REJECT.</p>
 <table>
-<tr><th>Candidate</th><th>Likely source</th><th>Why it might matter</th></tr>
-<tr><td>Injury/absence history</td><td>derivable from our own appearance gaps vs team schedule; prospective: Daily Faceoff</td><td>the #1 shared unobservable (T6) — even coarse absence spells help</td></tr>
-<tr><td>Projected lines &amp; scratches</td><td>Daily Faceoff</td><td>better scenario defaults; kills ghost-incumbent residue (T22)</td></tr>
-<tr><td>Referee assignments</td><td>already in our boxscore JSONs — unextracted</td><td>penalty-economy context (refs drive penalty rates)</td></tr>
-<tr><td>Travel load / time zones</td><td>static arena lat-longs + our schedule = computable offline</td><td>sharpens rest/b2b block</td></tr>
-<tr><td>Contract year / cap status</td><td>PuckPedia (public)</td><td>motivation confound + acquisition-selection instrument (T5)</td></tr>
-<tr><td>Draft pedigree</td><td>NHL API draft endpoints (free)</td><td>prior for low-evidence young players — where our bands are widest</td></tr>
-<tr><td>NHL EDGE tracking (speed/distance)</td><td>public since 2021-22</td><td>style-vector fuel (v2)</td></tr>
-<tr><td>AHL/OHL per-player stats</td><td>HockeyTech feeds — our roster scrapers already authenticate</td><td>THE recruiting product; rosters done, stats one view away</td></tr>
-<tr><td>Defensive style signals</td><td>entries-against/retrievals (research needed)</td><td>shot cards are offense-typed; defenders are in grayscale (C-2)</td></tr>
+<tr><th>Candidate</th><th>Source to investigate</th><th>Effort guess (verify!)</th><th>MVP call (verify!)</th></tr>
+<tr><td>Projected lines &amp; scratches</td><td>Daily Faceoff</td><td>LOW — even manual for ~60 movers</td><td><b>YES</b> — improves the September sealed predictions directly</td></tr>
+<tr><td>Injury/absence spells</td><td>derivable from our own appearance gaps</td><td>LOW</td><td>Post-MVP, park high</td></tr>
+<tr><td>Referee assignments</td><td>already inside our boxscore JSONs</td><td>LOW</td><td>Post-MVP</td></tr>
+<tr><td>Travel / time zones</td><td>arena coordinates + our schedule</td><td>LOW</td><td>Post-MVP</td></tr>
+<tr><td>Contract year / cap status</td><td>PuckPedia</td><td>MEDIUM (scrape)</td><td>Post-MVP research</td></tr>
+<tr><td>Draft pedigree</td><td>NHL API draft endpoints</td><td>LOW</td><td>Post-MVP</td></tr>
+<tr><td>NHL EDGE tracking</td><td>NHL EDGE public stats</td><td>MEDIUM</td><td>v2 (style)</td></tr>
+<tr><td>AHL/OHL player stats</td><td>HockeyTech feeds (our roster scrapers already log in)</td><td>MEDIUM</td><td>Post-MVP but strategic — the expansion pitch</td></tr>
+<tr><td>Defensive style signals</td><td>research needed</td><td>HIGH/unknown</td><td>v2</td></tr>
 </table>
-<p><b>Rule:</b> any new feature you propose must pass the same gauntlet as existing ones
-(lag proof, legality classification, serving parity) BEFORE it touches a model. You run
-that gauntlet.</p>
-</div>
+<p><b>Deliverable:</b> a short memo per candidate you investigate: source quality, real
+effort, MVP verdict + one-line why. If you find a candidate we never thought of — that's
+the best outcome this task can have. Add it to the table with your evidence.</p>
 
-<h2>DUTY 2 — Custodian of the Confounder Register (T1–T23)</h2>
-<div class="duty">
-<p>The threat register in <code>README.md</code> §2 + <code>ARCHITECTURE_PLAN.md</code> §6 is the
-company's causal immune system: 23 named threats, each SOLVED / MEASURED / PRICED / GATED /
-OPEN. You keep it TRUE:</p>
-<ul>
-<li><b>Re-verify:</b> independently reproduce the evidence behind 5 threats per week until
-you've touched all 23 (each has scripts/artifacts cited). Fresh-eyes disagreement = escalate.</li>
-<li><b>Keep current:</b> every pipeline change, new feature, or new season gets a "which
-threats does this touch?" note in the PR. You're the reviewer who asks it.</li>
-<li><b>Standing sensitivity suite (own the re-runs):</b> survivorship filter at ≥10 GP vs ≥20
-(T4) · era slices of the headline · per-cell conformal coverage (n_eff × role-delta — the
-K-2 finding) · MP-vs-inhouse xG drift (the witness aux) · rink-bias trends (T19).</li>
-<li><b>Red-team quarterly:</b> half a day, adversarial: "how would I fake this result?" —
-written findings, even (especially) when the answer is 'I couldn't'.</li>
-</ul>
-<p><b>Deliverable:</b> monthly one-page "Register Health" note — statuses, re-runs done,
-anything that moved.</p>
-</div>
-
-<h2>DUTY 3 — Continuous Data QA (the 2025-26 lesson, institutionalized)</h2>
-<div class="duty">
-<p>This season we found: empty shiftchart files from API outages, 505 silently-hollow game
-files, a whole season with zeroed outcomes. All caught by gates — gates you now operate:</p>
-<ul>
-<li><b>Every rebuild</b> runs the regression suite: <code>vendor/window_engine/README.md</code>
-gate list + <code>scripts/09</code> (official records) + <code>scripts/10</code> (crown jewel) +
-battery in <code>scripts/16</code>. Zero-issue baselines are documented; deviations block.</li>
-<li><b>New-season ingestion</b> (2026-27, from October): you own collection health — file
-sizes, stub detection, marker discipline, shiftchart emptiness (the HTML-report fallback
-in <code>html_shift_fallback.py</code> is certified for API gaps).</li>
-<li><b>Nightly during the season:</b> the actuals-scoring job for the public scoreboard
-(Duty 4) doubles as a data canary — anomalies there are your first alert.</li>
-</ul>
-</div>
-
-<h2>DUTY 4 — Product Surfaces (specs in HANDOFF.html Part 2)</h2>
-<div class="duty">
-<p>P0 public receipts scoreboard (Supabase; hard deadline: before the September seal) →
-P1 GM demo (API contract provided) → P2 trust layer (the receipts button: backtest table,
-calibration, per-shot audit trail). Your data-assurance work IS the content of P2 —
-the two halves of your role feed each other.</p>
-</div>
-
-<h2>Cadence, boundaries, definition of done</h2>
-<table>
-<tr><th>Rhythm</th><th>What</th></tr>
-<tr><td>Weekly (30 min w/ Griffin)</td><td>feature-audit sheet progress · register health · surface demo</td></tr>
-<tr><td>Per rebuild</td><td>regression gates green before anything ships downstream</td></tr>
-<tr><td>Monthly</td><td>Register Health note + sensitivity-suite refresh</td></tr>
-</table>
-<p><b>You do NOT own:</b> model architecture, training, or the projection math (Griffin +
-Claude). <b>You DO have veto standing:</b> if a feature fails your gauntlet or a gate goes
-red, it does not ship — no exceptions, including deadline pressure. That veto is the job.</p>
-
-<h3>First two weeks, concretely</h3>
-<ol>
-<li>Days 1–2: HANDOFF Part 1 onboarding audits + verdict note.</li>
-<li>Days 3–7: Duty 1A sweep started (target: people-block + context-block features audited)
-+ P0 scoreboard skeleton (Supabase schema up, sealed-JSON ingested).</li>
-<li>Days 8–14: finish 1A sheet v1 · first sufficiency memo (pick 3 candidates from 1B) ·
-P0 demo-able end-to-end with fake actuals.</li>
-</ol>
-
-<div class="box"><b>The cultural rule, again, because it's the whole job:</b> every fatal bug in
-this project's history was caught by someone refusing to accept "it's probably fine."
-Two of those catches made the headline number BETTER. Your title is basically
-Professional Refuser of "Probably Fine." 🏒</div>
+<h2>Rhythm</h2>
+<p>Weekly 30 minutes with Griffin: sweep progress · candidate memos · anything that smelled
+wrong. <b>The one cultural rule:</b> every major bug in this project was caught by someone
+refusing to accept "it's probably fine." If a number disagrees with the pbp — the source of
+truth — you've found something important. Bring paths and numbers. 🏒</p>
 
 </body>
 </html>
