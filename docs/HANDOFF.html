@@ -84,7 +84,9 @@ and your personal verdict. Anything broken → we trace it together via the per-
 
 <h3><span class="tag">P0</span> The Live Receipts Scoreboard — public, Supabase (deadline: before Sept seal)</h3>
 <p>The page where our sealed 2026-27 predictions get scored by reality, in public, all season.
-This is the company's shock-the-world artifact.</p>
+This is the company's shock-the-world artifact — the entire plan is <b>one target, one event,
+one raise</b>: seal in September, score in public through October, raise in November on the
+receipts. Everything you build here is the stage that event happens on.</p>
 <table>
 <tr><th>Piece</th><th>Spec</th></tr>
 <tr><td>Input</td><td><code>artifacts/sealed_2026.json</code> — schema: <code>{player_id, dest_team,
@@ -98,6 +100,14 @@ actuals table (we'll wire a JSON output for you) → push to Supabase.</td></tr>
 inside-band ✓/✗, running coverage % vs the 80% promise, and the SHA-256 + seal date up top.
 Design vibe: sports-scoreboard honesty, not marketing gloss. Misses shown as plainly as hits —
 that IS the brand.</td></tr>
+<tr><td>"Market Calls" tab <span class="warn">(conditional — only if the backtest gate passes)</span></td>
+<td>second tab, same page: everywhere our model disagrees with a Vegas closing line
+<i>because of roster movement</i> (mover SOG props, roster-churn win totals), the call is
+logged pre-close with timestamp + hash — paper-trade only, flat stakes. Columns: date, market,
+our probability, de-vigged closing implied, side, result, running CLV%. Same immutable-rows
+pattern as <code>predictions</code>; data arrives from a Claude-built logging script (schema
+will mirror <code>sealed_2026.json</code>'s discipline). Build the tab skeleton with the rest
+of P0; it stays hidden until the historical backtest clears its gate.</td></tr>
 </table>
 
 <h3><span class="tag">P1</span> The GM Demo app</h3>

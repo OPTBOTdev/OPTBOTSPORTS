@@ -42,11 +42,22 @@ pushing · anything that smells wrong gets reported, not "probably fine"-d.</li>
 <p><b>Your job in one sentence:</b> verify every number our models eat, and evaluate the
 numbers we DON'T have yet — how easy to get, and whether they matter for the MVP.</p>
 
-<div class="box"><b>Context:</b> the system already beats the industry projection by 7.6%
-on 860 historical moves, with error bars measured at 80.0% accuracy. <b>The MVP bar:</b>
-enough proof to land a partnership with an NHL team or seed funding — that's it. Not
-perfection; provable credibility. Your work is a direct part of that proof ("every
-feature independently audited by a second engineer" is a sentence that closes meetings).
+<div class="box"><b>The company plan (so your work has a WHY):</b> one target, one event,
+one raise. In <b>September</b> we hash-lock ("seal") predictions for every 2026-27 mover.
+In <b>October</b> those predictions score themselves in public on the scoreboard — plus a
+timestamped log of our disagreements with Vegas closing lines wherever roster movement is
+the reason. In <b>November</b> we raise on those receipts. No sales grind before the proof;
+the proof sells itself.
+<pre style="margin:8px 0 2px">NOW → SEPT  finish the machine · audit every feature (YOU) · seal the movers · scoreboard live
+OCT         the event — predictions score themselves in public (+ the market-calls log)
+NOV         raise on: -7.6% backtest · live receipts · market-beat log</pre>
+<b>Context:</b> the system already beats the industry projection by 7.6% on 860 historical
+moves, with error bars measured at 80.0% accuracy. <b>The MVP bar:</b> enough proof to land
+a partnership with an NHL team or seed funding — that's it. Not perfection; provable
+credibility. Your work is a direct part of that proof ("every feature independently audited
+by a second engineer" is a sentence that closes meetings) — and it has a hard clock:
+<b>everything sealed in September is frozen forever, so a feature bug you catch in August
+is a save; the same bug found in October is a public miss.</b>
 <br><br><b>Your two manuals (keep these files in the same folder as this one, or open
 them from the repo <code>docs/</code>):</b><br>
 📖 <a href="AUDITOR_GUIDE.html">AUDITOR_GUIDE.html</a> — datasets &amp; paths (pbp = source
@@ -56,7 +67,11 @@ plain English with a copy-paste command.<br>
 plain language, what each feature's job is, and the MVP triage rule.</div>
 
 <h2>Task 1 — Audit every existing feature (the sweep)</h2>
-<p>One row per feature (the row list = the Feature Key in the Auditor Guide), six checks each:</p>
+<p><b>Goal, specifically:</b> by the September seal, every feature the projection engine
+eats has six green (or explained) verdicts with your name on them — so when the October
+predictions are public and someone asks "why should we trust the inputs?", the answer is a
+document, not a promise. One row per feature (the row list = the Feature Key in the Auditor
+Guide), six checks each:</p>
 <table>
 <tr><th>Check</th><th>Plain meaning</th><th>Pass bar</th></tr>
 <tr><td>1. Source</td><td>trace the number to the script that makes it and the raw file it came from</td><td>documented chain, ends at pbp/shifts/MoneyPuck</td></tr>
@@ -70,13 +85,17 @@ plain language, what each feature's job is, and the MVP triage rule.</div>
 verdicts, dated, your name on it.</p>
 
 <h2>Task 2 — Evaluate the extra columns (how easy · is it MVP)</h2>
-<p>For each candidate below (full context + phase-by-phase reasoning in
-<a href="PHASES_EXPLAINED.html">PHASES_EXPLAINED.html</a>): investigate the source, estimate
-the effort honestly, and give a verdict against the MVP bar (<i>does it strengthen the
-proof that lands a team partnership or funding?</i>). Recommend BUILD / PARK / REJECT.</p>
+<p><b>Goal, specifically:</b> decide which missing data sources make the <b>October proof</b>
+stronger — and refuse the rest. The triage question for every candidate is now sharper than
+"is it MVP": <i>does it improve (a) the sealed September predictions, (b) the public
+scoreboard, or (c) the market-calls log — before October?</i> If the answer is no, it's
+post-MVP no matter how cool. For each candidate below (full context + phase-by-phase
+reasoning in <a href="PHASES_EXPLAINED.html">PHASES_EXPLAINED.html</a>): investigate the
+source, estimate the effort honestly, and recommend BUILD / PARK / REJECT.</p>
 <table>
 <tr><th>Candidate</th><th>Source to investigate</th><th>Effort guess (verify!)</th><th>MVP call (verify!)</th></tr>
 <tr><td>Projected lines &amp; scratches</td><td>Daily Faceoff</td><td>LOW — even manual for ~60 movers</td><td><b>YES</b> — improves the September sealed predictions directly</td></tr>
+<tr><td><b>Historical closing odds</b> (SOG props, season win totals)</td><td>start: <code>D:\out\oddo_all.csv</code> (already collected, UNAUDITED — what markets? what seasons? closing or opening lines?); gaps → historical odds archives</td><td>LOW to audit what we have; MEDIUM if we must hunt archives</td><td><b>YES</b> — gates the entire market-calls proof leg; the backtest vs Vegas closing lines cannot start until this file is understood</td></tr>
 <tr><td>Injury/absence spells</td><td>derivable from our own appearance gaps</td><td>LOW</td><td>Post-MVP, park high</td></tr>
 <tr><td>Referee assignments</td><td>already inside our boxscore JSONs</td><td>LOW</td><td>Post-MVP</td></tr>
 <tr><td>Travel / time zones</td><td>arena coordinates + our schedule</td><td>LOW</td><td>Post-MVP</td></tr>

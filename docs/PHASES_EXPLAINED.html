@@ -31,8 +31,19 @@ NHL team or seed funding</b> — nothing more. Concretely that proof is: (1) the
 engine — today's <b>v0</b> already beats the industry by 7.6%, hopefully upgraded to
 <b>v1</b> (trained Phase A+B) if it wins the shootout; (2) <b>sealed predictions</b> for
 every 2026-27 mover, hash-locked in September; (3) the <b>public scoreboard + demo</b> that
-let anyone watch the proof happen live. <u>The triage rule for any feature question:</u>
-does it strengthen THAT proof before October? If not, it's post-MVP no matter how cool.</div>
+let anyone watch the proof happen live; (4) <b>the market-calls log</b> — wherever our
+projections disagree with Vegas closing lines <i>because of roster movement</i> (mover
+shots-on-goal props, win totals for roster-churn teams), we log the call pre-close,
+timestamped and hashed, on the same scoreboard. Paper-trade only; the record IS the proof
+("42 logged calls against closing lines" lands harder with investors than any RMSE).
+It only ships if its own historical backtest gate passes — no number, no claim.
+<pre style="margin:10px 0 4px">NOW → SEPT  finish the machine: GPU shootout (v1 vs v0) · seal the 2026-27
+            movers · scoreboard live · market-disagreement log running
+OCT         THE EVENT — predictions score themselves in public
+NOV         raise on: -7.6% backtest + live receipts + market-beat log</pre>
+<u>The triage rule for any feature question:</u> does it strengthen the sealed predictions,
+the scoreboard, or the market-calls log before October? If not, it's post-MVP no matter
+how cool.</div>
 
 <h2>PHASE A — the Environment Tower &nbsp;<small>("describe the ice around him")</small></h2>
 <p><b>The point:</b> a player's stats are half him, half his surroundings. Phase A is a
@@ -100,6 +111,13 @@ against the MVP rule ("does it change the October number, demo, or scoreboard?")
 <td class="mvp">MVP — YES, lightweight</td><td>September's sealed predictions need a line
 assignment for ~60 movers; real projected lines beat our TOI-rank guess. Even a manual
 pull for those 60 helps the October number directly.</td></tr>
+<tr><td>Historical closing odds (<code>D:\out\oddo_all.csv</code> + archives)</td>
+<td>Market-calls backtest (proof leg 4)</td>
+<td class="mvp">MVP — YES, gates a proof leg</td><td>we only publish market calls if a
+frozen-clock backtest vs historical closing lines passes (positive CLV, CI clear, 300+
+bets). That backtest can't start until someone audits what's actually in the odds file:
+which markets, which seasons, closing or opening lines. First concrete deliverable of
+the whole plan.</td></tr>
 <tr><td>Injury/absence spells (derivable from our own gaps)</td><td>C (talent context), scoreboard notes</td>
 <td class="post">POST-MVP (cheap, park high)</td><td>bands already price it; nice explainer
 ("missed 20 games") for the scoreboard later.</td></tr>
