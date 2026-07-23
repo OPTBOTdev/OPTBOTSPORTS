@@ -1,8 +1,10 @@
-# The OptBot CIN — Final Architecture Plan (canonical, v2.1 · Jul 2026)
+# The OptBot CIN — Final Architecture Plan (canonical, v2.3 · Jul 2026)
 
-Single source of truth for Phases A/B/C. v2.1 incorporates the second adversarial
-pass: K-1..K-3 (critical), S/A/B-series hardening. Every fix is listed inline where
-it lives, marked [Kx]/[Sx]/[Ax]/[Bx].
+Single source of truth for Phases A/B/C. v2.1 incorporated the second adversarial
+pass: K-1..K-3 (critical), S/A/B-series hardening. v2.3 adopts the OXF stack
+(Orthogonal Cross-Fit) from the July 23 design panel (ADR-001): structural
+elimination of roster fingerprinting — "no reward, no data, no shared state."
+Every fix is listed inline where it lives, marked [Kx]/[Sx]/[Ax]/[Bx]/[OXFx].
 
 ---
 
@@ -47,7 +49,59 @@ and new-coach UNKs are exactly the interesting case [A5/F3]** → h_ctx (256d)
 Fusion: 2 pre-norm attention blocks over [h_with, h_vs, h_ctx] + CLS → h_env (256d)
 
 Absent by design: focal identity · season/era ids · convicted features.
-Teammate dropout 20%. UNK = shell-only members (AHL inference mode).
+UNK = shell-only members (AHL inference mode).
+
+### THE OXF STACK [v2.3, ADR-001] — structural fingerprint elimination
+The July 23 adversarial panel (4 designers, 14 attacks) established that NO single
+mechanism eliminates roster fingerprinting: fold-routing alone leaves a transferable
+"complete the missing man" circuit learned from other folds; reward-starvation alone
+leaves identity-shaped residuals wherever provided scalars under-explain. The
+conjunction closes every pathway found:
+
+1. **[OXF1] Focal-orthogonalized labels (the reward kill).** Every tower trains on
+   Ỹ(w) = Y(w) − τ̂(focal, w), where τ̂ is UNSHRUNK, SPLIT-SAMPLE (estimated from
+   the focal's windows disjoint from w), OOF, identity-blind-baseline. Mean-zero
+   focal component given inputs ⇒ inferring the missing man pays ZERO loss reward
+   in every fold. (Unshrunk+split-sample is load-bearing: shrinkage leaves an
+   identity-correlated residual that re-funds the completion circuit.) Poisson
+   heads: apply as fixed offset in the log-link.
+2. **[OXF2] K=5 player-fold cross-fitted towers, shared-nothing (the data kill).**
+   Tower T_k excludes every row whose FOCAL is in fold k; the tower scoring p never
+   studied p. Shared-NOTHING: per-fold embedding tables, norm/optimizer state,
+   early-stopping on own-fold-excluded validation. Fold contract
+   (contracts/fold_contract.py): salted hash, K, manifest-pinned; loader asserts.
+   Stratify folds by position × talent-decile × era coverage.
+3. **[OXF3] Fold discipline THROUGH the trunk.** The trunk holds talent⊕bio (a
+   quasi-ID) next to Y — fold-routing must not stop at the tower. K trunks on
+   cached OOF h_env; serving routes TOWER by fold(focal-of-record of the window)
+   and TRUNK by fold(projected player). UNK/rookies → ensemble mean (valid for
+   all folds by construction).
+4. **[OXF4] Synthetic teammate-ID dropout DELETED.** Masking a real contributor
+   while Y keeps his contribution is a forced-misattribution factory (three
+   independent attacks converged on this). UNK robustness instead via talent-gated
+   UNK substitution: only members whose EB talent is within shrinkage noise of
+   zero (shell-sufficient) may be masked. UNK-degradation probe unchanged.
+5. **[OXF5] Member talent scalars in the dynamic shell** (+ n_eff), computed
+   EXACT PAIRWISE LEAVE-FOCAL-OUT: member quality gets a legal, explicit absorber;
+   ID vectors are freed for style/context. P3's baseline stays UNCONDITIONED on
+   these scalars (a conditioned probe is a blinded probe).
+6. **[OXF6] Leave-focal-out team priors** (surface change): team_xgf60_prior etc.
+   currently contain the focal's own past production — the prior-echo channel.
+7. **[OXF7] Probes are falsification tests, never tuning signals.** Per-fold
+   OOS P3-incremental on the tower's held-out fold (gate R²_incr < 0.01) +
+   completion probe P3b + sibling-twin parity. A red probe files a BUG, never a
+   seed re-roll. All gate CIs cluster-bootstrap by gamePk (sibling rows share Y).
+8. **[OXF8] The honest floor:** glued duos (≥85% co-occurrence, Sedin-class) are
+   unidentifiable by ANY estimator — that is the RAPM identifiability floor, not
+   leakage. Duo co-occurrence census wires into [K3]: their counterfactuals emit
+   extrapolated:true or REFUSED_OOS. Refusal is the feature.
+
+Claim we may make (scoped): the PER-PLAYER fingerprint pathway is structurally
+eliminated — no reward anywhere (OXF1), no data in the scoring path (OXF2/3), no
+shared state (OXF2), no synthetic hidden-member rows (OXF4). Remaining residuals:
+τ̂ estimation error (mean-zero ⇒ variance, not bias) and the OXF8 floor (flagged).
+GPU cost: 5 towers ×2–4h + 5 trunks ×1–2h ≈ one weekend. Rejected designs and
+attack transcripts: docs/ADR-001_fingerprint_elimination.md.
 
 **F-1 MEASURED (Jul 2026, n=128k):** corr(teammate form, focal talent):
 naive-current 0.310 → season-lagged 0.267. Finding: most of that correlation

@@ -101,13 +101,20 @@ not an interpretation.</p>
 re-enter through the back door: five teammate IDs nearly identify the team, the line,
 and often the focal player himself (who else centers Draisaitl and Hyman?). A tower
 that learns "this specific WITH-set ⇒ elite production" has partially memorized
-McDavid without ever seeing his ID. Defenses, all active: <b>teammate dropout 20%</b>
-(the WITH-set is never reliable enough to be a fingerprint), <b>probe P3-incremental</b>
-run every epoch (a ridge probe asks: does h_env predict the focal player's talent
-<i>better than raw teammate-quality features alone would</i>? If yes, information about
-the focal player beyond honest assortativity is leaking — checkpoint rejected), and
-the <b>K-1 re-derivation</b> (§7) which mops up whatever linemate credit the tower
-legitimately claims. This threat is priced, probed, and gated — not assumed away.</div>
+McDavid without ever seeing his ID. <b>v2.3 UPDATE — this threat is now structurally
+ELIMINATED, not mitigated (the OXF stack, ADR-001,</b> adopted after a
+4-designer / 14-attack adversarial panel): <b>(1) orthogonalized labels</b> — every
+training outcome has the focal player's own estimated contribution subtracted
+(unshrunk, split-sample), so guessing the missing man pays ZERO reward anywhere;
+<b>(2) player-fold cross-fitting, shared-nothing</b> — the tower AND trunk that score
+you never trained on a single row where you were the hidden man; <b>(3) synthetic
+teammate dropout DELETED</b> — masking a real contributor while his effect stayed in
+the outcome was quietly training the fingerprint; <b>(4) leave-focal-out team priors
++ pairwise-LOO member scalars</b> close the echo side doors. Probes remain as
+falsification tests (a red probe files a bug, never a re-roll). The honest floor:
+glued duos (~zero apart-minutes) are unidentifiable by ANY method — those
+counterfactuals get flagged extrapolated or refused, never guessed. Full derivation:
+phase_a_paper.pdf §2.4 + ADR-001_fingerprint_elimination.md.</div>
 
 <h2>3. What the tower eats — every input, and why it earned its seat</h2>
 <p>The governing law (enforced in code by <code>contracts/tower_schema.py</code>,

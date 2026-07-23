@@ -101,14 +101,75 @@ destination's people and context; $\tau(p)$ does not move.
 \textbf{The residual threat: roster fingerprinting.} Five teammate IDs nearly
 identify the team, the line, and often the focal player (who else centers
 Draisaitl and Hyman?). A tower that learns ``this WITH-set $\Rightarrow$ elite
-production'' has partially memorized the focal player without seeing his ID.
-Active defenses: (i)~teammate dropout 20\% --- the WITH-set is never reliable
-enough to fingerprint; (ii)~probe P3-incremental every epoch --- a ridge probe
-asks whether \henv{} predicts focal talent \emph{better than raw
-teammate-quality features alone}; if yes, the checkpoint is rejected;
-(iii)~the K-1 re-derivation (\S\ref{sec:k1}) reabsorbs whatever linemate credit
-the tower legitimately claims. Priced, probed, gated --- not assumed away.
+production'' has partially memorized the focal player without seeing his ID ---
+and at $\dodo{p \text{ leaves}}$ the old ice keeps his credit, mispricing both
+sides of every star trade. Early designs \emph{mitigated} this (dropout, probes,
+K-1). Section~\ref{sec:oxf} eliminates it structurally.
 \end{keybox}
+
+\subsection{Structural elimination: the OXF stack (v2.3)}
+\label{sec:oxf}
+A four-designer, fourteen-attack adversarial panel (July 2026; ADR-001)
+established two facts. \emph{Routing alone fails:} excluding $p$'s focal rows
+from the tower that scores him still permits a \emph{player-generic} completion
+circuit --- ``retrieve the habitual completer of this WITH-set and add his
+quality'' --- learned from other players' rows and executed for $p$ at scoring.
+\emph{Reward-removal alone fails:} any provided quality scalar under-explains
+identity somewhere (EB shrinkage, form drift, pair chemistry), and the residual
+is identity-shaped, re-funding the circuit. Elimination is a \textbf{conjunction}:
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+\item \textbf{Orthogonalized labels (no reward).} Every tower trains on
+$\tilde{Y}(w) = Y(w) - \hat{\tau}(\mathrm{focal}, w)$ with $\hat{\tau}$
+\emph{unshrunk}, \emph{split-sample} (fit on the focal's windows disjoint from
+$w$), out-of-fold, identity-blind. The focal component of the label is mean-zero
+given the inputs, so inferring the missing man pays zero loss reward in every
+fold. Unshrunk and split-sample are load-bearing: a shrunk $\hat\tau$ leaves an
+identity-correlated residual that quietly re-funds completion.
+\item \textbf{Player-fold cross-fitting, shared nothing (no data).} $K{=}5$
+folds of players; tower $T_k$ never trains on a row whose focal is in fold $k$;
+player $p$ is always scored by $T_{k(p)}$ --- \emph{the tower that scores you
+never studied you}, mirroring the existing OOF talent discipline. Per-fold
+embedding tables, normalization and early-stopping state; a fold contract
+asserted in the data loader.
+\item \textbf{Fold discipline through the trunk.} The trunk holds
+$\tau(p)\oplus\mathrm{bio}$ --- a quasi-ID --- beside $Y$; routing must not stop
+at the tower. $K$ trunks train on cached out-of-fold \henv{}; serving routes the
+tower by the window's focal-of-record and the trunk by the projected player.
+\item \textbf{Synthetic dropout deleted (no manufactured holes).} Masking a real
+contributor while $Y$ keeps his contribution is a forced-misattribution factory
+(three independent attacks converged here). UNK robustness comes from
+talent-gated substitution: only shell-sufficient (near-zero-talent) members may
+be masked.
+\item \textbf{Member talent scalars in the shell,} computed exact pairwise
+leave-focal-out: member quality gains a legal absorber; ID vectors are freed for
+style. The P3 probe's baseline stays \emph{unconditioned} on them.
+\item \textbf{Leave-focal-out team priors} close the prior-echo channel (a
+team's xG prior currently contains the focal's own past production).
+\item \textbf{Probes as falsification, never tuning.} Per-fold out-of-sample
+P3-incremental (gate $R^2_{\mathrm{incr}} < 0.01$), completion probe, sibling
+parity; a red probe files a bug, never a re-roll. All confidence intervals
+cluster-bootstrap by game (sibling rows share outcomes).
+\item \textbf{The honest floor.} Glued duos ($\ge$85\% co-occurrence) are
+unidentifiable by \emph{any} estimator --- the RAPM identifiability floor, not
+leakage. A duo census routes their counterfactuals to
+\texttt{extrapolated:true} or \texttt{REFUSED\_OOS}. Refusal is the feature.
+\end{enumerate}
+
+\noindent\textbf{Scoped claim.} The per-player fingerprint pathway is
+structurally eliminated: no reward anywhere (1), no data in any scoring path
+(2--3), no shared state (2), no manufactured hidden-member rows (4). Remaining
+residuals: $\hat\tau$ estimation error (mean-zero $\Rightarrow$ variance, not
+bias) and the identifiability floor (flagged, refused). Cost: $5\times$ tower
+runs $+\,5\times$ cheap trunk runs --- one GPU weekend.
+
+\noindent\textbf{Why this is the market edge, not hygiene.} The betting market
+prices movers on trailing statistics --- co-occurrence credit. A fingerprinting
+tower inherits a cousin of the \emph{same} bias, shrinking model-vs-market
+disagreement exactly where we bet. OXF removes co-occurrence-fingerprint credit
+from the environment and prices the player only through his own orthogonalized
+channel, so disagreements concentrate on star-adjacent movers and
+stayers-after-departure --- the two seams the market systematically misprices.
 
 \section{Inputs: every seat earned, every ban evidenced}
 Governing law, enforced at import by \texttt{contracts/tower\_schema.py}: every
