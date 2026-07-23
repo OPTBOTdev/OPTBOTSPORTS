@@ -128,10 +128,16 @@ Fail any → v0 ships in October, v1 iterates. The company never depends on the 
 
 ## 7. BUILD ORDER
 
-1. Rollups: LOO member-form [F1] · member gsc [A1] · coach table+shell [A5] → v3.1
-2. [K2] role-delta slice of the 860 backtest (CPU, tonight-class)
-3. Trainer (scripts/19): everything above baked in → READY FOR GPU
-4. Train + era-fixed ablations → tower gate
-5. [K1] talent re-derivation vs tower-env → sniff → harness shootout (full gate list)
-6. [K3] joint-support + extrapolation flags in serving
-7. September seal · October public scoring
+1. ✅ Rollups: LOO member-form [F1] · member gsc [A1] · coach table+shell [A5]
+   (coach 2025-26 completed Jul 22; player_bio.parquet 100% hand/pos/DOB)
+2. ✅ [K2] role-delta slice — measured, table in §5
+3. ✅ Trainer SURFACE (scripts/21, 21a, 21b): one audited table per season,
+   contract-gated, member lists aligned, manifest-hashed; new columns passed
+   the script-24 lag audit (FLAGGED 0, control 0.902)
+4. Trainer (scripts/19): reads trainer_surface/ → READY FOR GPU (blocked: GPU)
+5. Train + era-fixed ablations → tower gate
+6. [K1] talent re-derivation vs tower-env → sniff → harness shootout (full gate list)
+7. [K3] joint-support + extrapolation flags in serving
+8. September seal · October public scoring
+   (parallel lane: odds_games.parquet 2011-2021 + win_totals.parquet 2018-2025
+   landed for the market-calls backtest)
