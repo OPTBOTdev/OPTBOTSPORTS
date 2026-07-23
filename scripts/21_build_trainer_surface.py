@@ -143,12 +143,22 @@ if __name__ == "__main__":
         df.to_parquet(fp, index=False)
         cov = {c: round(float(df[c].notna().mean()), 4)
                for c in df.columns if not c.startswith(("with_", "vs_"))}
-        # member-list coverage: share of member slots with a real value
-        for c in ["with_form", "with_age", "with_hand", "vs_form", "vs_age"]:
-            vals = df[c].dropna()
-            flat = [x for lst in vals for x in (lst if isinstance(lst, list) else [])]
-            cov[c] = round(1 - float(np.mean([pd.isna(x) for x in flat])), 4) \
-                if flat else 0.0
+        # member-list coverage over REAL members only (id>0; zeros are padding
+        # the loader masks via seconds<=0 — counting them fakes missingness)
+        for side in ("with", "vs"):
+            ids_flat = np.array([x for lst in df[f"{side}_ids"]
+                                 for x in (lst if lst is not None else [])],
+                                dtype=float)
+            real = ids_flat > 0
+            for feat in ("form", "age", "hand"):
+                flat = np.array([v for lst in df[f"{side}_{feat}"]
+                                 for v in (lst if isinstance(lst, (list, np.ndarray))
+                                           else [])], dtype=object)
+                if len(flat) != len(ids_flat) or not real.any():
+                    cov[f"{side}_{feat}"] = 0.0
+                    continue
+                miss = pd.isna(pd.Series(flat[real]).astype(object)).mean()
+                cov[f"{side}_{feat}"] = round(1 - float(miss), 4)
         manifest["seasons"][str(s)] = {"rows": len(df),
                                        "sha256": hashlib.sha256(
                                            fp.read_bytes()).hexdigest()[:16]}
