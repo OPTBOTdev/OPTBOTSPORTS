@@ -46,7 +46,9 @@ SYNTH_PEOPLE = ["with_ids", "with_seconds", "vs_ids", "vs_seconds"]  # the inter
 # situational structure. 100% populated in source; 37% of rows enter mid-window.
 MARG = [
     "seconds", "duration",                    # exposure (loss weights / offsets)
-    "shift_count_in_window", "time_since_last_shift_s", "last_shift_len_s",
+    "shift_count_in_window", "time_since_last_shift_s",
+    # last_shift_len_s: NOT in windows v3 (never extracted); re-add if/when the
+    # extractor emits it — do not fake or proxy it (fatigue signal, entry-side)
     "onice_elapsed_at_window_start", "entered_after_start", "entry_offset_s",
     "is_multistint",                          # blended-row flag: trainer downweights
 ]
