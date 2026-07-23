@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Environment Tower — OptBot Phase A, the Paper</title>
+<style>
+  :root { --navy:#16294A; --red:#D7263D; --ice:#EDF3FB; }
+  body { font-family:Georgia,'Times New Roman',serif; color:#1a1a1a; max-width:820px;
+         margin:0 auto; padding:30px 24px; line-height:1.62; font-size:16px; }
+  h1 { font-size:27px; color:var(--navy); line-height:1.25; margin-bottom:2px; }
+  .sub { color:#555; font-style:italic; margin-top:0; }
+  h2 { font-size:20px; color:var(--navy); margin-top:38px; border-bottom:2px solid var(--red); padding-bottom:4px; }
+  h3 { font-size:16.5px; color:var(--red); margin-top:24px; }
+  code { background:var(--ice); border-radius:5px; font-family:Consolas,monospace; font-size:13.5px; padding:1px 5px; }
+  .eq { background:var(--ice); border-left:4px solid var(--navy); padding:10px 16px; margin:14px 0;
+        font-family:Consolas,monospace; font-size:14px; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; margin:12px 0; font-family:'Segoe UI',sans-serif; }
+  th { background:var(--navy); color:#fff; text-align:left; padding:6px 9px; }
+  td { border:1px solid #d6e2f2; padding:5px 9px; vertical-align:top; }
+  tr:nth-child(even) td { background:var(--ice); }
+  .box { background:var(--ice); border:1px solid #c9d6e8; border-radius:10px; padding:14px 18px; margin:16px 0; font-family:'Segoe UI',sans-serif; font-size:14.5px; }
+  .abstract { border:1px solid #c9d6e8; border-radius:10px; padding:16px 22px; margin:18px 0; background:#fafcff; font-size:15px; }
+  .q { color:var(--red); font-weight:bold; }
+  blockquote { border-left:3px solid var(--red); margin-left:0; padding-left:16px; color:#444; }
+</style>
+</head>
+<body>
+
+<h1>The Environment Tower: an identity-free neural encoder of hockey context</h1>
+<p class="sub">OptBot Phase A — design rationale, full specification, and honest limits ·
+July 2026 · companion to ARCHITECTURE_PLAN.md v2.2</p>
+
+<div class="abstract">
+<b>Abstract.</b> A hockey player's observed statistics are a blend of who he is and
+what surrounded him — linemates, opponents, coach, score, zone, fatigue, rink. Any
+system that projects a player onto a NEW team must separate the two, because the
+whole question is "keep the player, swap the surroundings." Phase A is a small
+(~2&nbsp;M parameter) neural network with one job: compress everything that surrounds a
+player during a stretch of ice time into a single vector, <code>h_env</code>, <b>while
+provably knowing nothing about the player himself</b>. This paper explains why the
+encoder must be identity-free, what it eats and why each input earned its place, how
+it trains, how it interacts with Phase B (the combiner) and Phase C (the player side),
+what can still go wrong, and — candidly — where it aligns with and where it is
+<i>not required by</i> the October MVP proof.
+</div>
+
+<h2>1. The problem, stated precisely</h2>
+<p>We want, for player <i>p</i>, destination environment <i>E′</i>, and decision time
+<i>t₀</i>:</p>
+<div class="eq">theta(p, E′, t₀) = E[ first-40-game on-ice impact | do(E ~ E′), history(p, &lt;t₀) ]</div>
+<p>Read it aloud: <i>the expected on-ice impact over his first ~40 games, if we
+surgically set his environment to E′, given only what was knowable about him before
+t₀.</i> The <code>do(·)</code> is the whole company. Ordinary stats models learn
+"players who happened to be in good environments produce more" — an association.
+We need "what happens when we <b>place</b> this player into that environment" — an
+intervention. The difference is why a model can be excellent at prediction and
+useless for a trade decision.</p>
+
+<p>For the intervention to be computable, the model must factor into pieces we can
+swap independently. That forces the three-part shape:</p>
+<div class="eq">outcome ≈ g( h_env(E),&nbsp; talent(p),&nbsp; levers(usage) )   — three pipes, never entangled</div>
+<p>Phase A builds <code>h_env</code>. Phase C builds <code>talent</code>. Phase B is
+<code>g</code>. This paper is about the first pipe, but §6–7 show the joints,
+because the tower's design decisions only make sense in light of what the other two
+pipes require of it.</p>
+
+<h2>2. The central design decision: why the tower must be identity-free</h2>
+<p>The single most important sentence in this paper: <b>the tower never sees the
+player it is describing the ice for.</b> No ID, no stats, no priors, no deployment
+history. Three architectures were considered; two were rejected.</p>
+
+<h3>2a. Rejected: the monolith</h3>
+<p>One network eating player + environment + usage, predicting outcomes. It would
+predict <i>well</i> — and be unusable. With everything entangled, "swap the team"
+has no handle to pull: the network's internal representation of McDavid is partly
+a representation of Draisaitl and of Edmonton's pace, and no one can say which part.
+Swapping inputs produces an answer, but not the answer to the causal question —
+the estimated effect of the environment is confounded by every player who
+selected into it.</p>
+
+<h3>2b. Rejected: the firewalled two-stream (our own previous design)</h3>
+<p>The legacy Phase A (still on disk as <code>encoder.py</code>) put a focal-player
+identity stream and a context stream in one module, with a one-way attention
+"firewall" so context could peek at a detached identity summary. The audit verdict:
+firewalls of this kind are <i>promises, not proofs</i>. Gradient paths are blockable;
+information paths through shared batch statistics, through co-adapted training
+dynamics, and through the sheer presence of the focal embedding in the same module
+are not. And every leak is invisible until it manifests as an overconfident wrong
+answer on exactly the rows we sell — movers. We deprecated the design (July 2026)
+rather than audit it forever: <b>the cheapest firewall is absence.</b></p>
+
+<h3>2c. Chosen: absence, plus a separate talent channel</h3>
+<p>The tower's inputs are the surroundings only. The player enters the system once,
+in Phase B, through a pre-computed, frozen scalar channel (§7). Now "swap the
+environment" is literal: recompute <code>h_env</code> with the destination's people
+and context; the talent numbers do not move. The intervention is an actual code path,
+not an interpretation.</p>
+
+<div class="box"><b>The subtle residual threat (T-fingerprint).</b> Identity can
+re-enter through the back door: five teammate IDs nearly identify the team, the line,
+and often the focal player himself (who else centers Draisaitl and Hyman?). A tower
+that learns "this specific WITH-set ⇒ elite production" has partially memorized
+McDavid without ever seeing his ID. Defenses, all active: <b>teammate dropout 20%</b>
+(the WITH-set is never reliable enough to be a fingerprint), <b>probe P3-incremental</b>
+run every epoch (a ridge probe asks: does h_env predict the focal player's talent
+<i>better than raw teammate-quality features alone would</i>? If yes, information about
+the focal player beyond honest assortativity is leaking — checkpoint rejected), and
+the <b>K-1 re-derivation</b> (§7) which mops up whatever linemate credit the tower
+legitimately claims. This threat is priced, probed, and gated — not assumed away.</div>
+
+<h2>3. What the tower eats — every input, and why it earned its seat</h2>
+<p>The governing law (enforced in code by <code>contracts/tower_schema.py</code>,
+which refuses unclassified features at import): every input must be either exactly
+constructible for a hypothetical destination from pre-t₀ data (<b>SYNTH</b>), or
+servable as a distribution via the slot bootstrap (<b>MARG</b>), or it is
+<b>BANNED</b>. The test is always serving-time honesty: <i>could we produce this
+number on trade day, for a trade that hasn't happened?</i></p>
+
+<h3>3a. The people (the intervention itself)</h3>
+<table>
+<tr><th>Input</th><th>Why it's here</th></tr>
+<tr><td><code>with_ids</code>, <code>vs_ids</code> (≤5 each) → learned 96-d vectors</td>
+<td>WHO is beside and against him — the single largest environmental fact, and the
+one v0 is blind to. McDavid-as-linemate ≠ generic first-line linemate. Learned
+identity vectors let the tower represent specific humans. The table is small
+(~1,700 players) and deliberately starved (96-d) to resist memorization.</td></tr>
+<tr><td><code>with_seconds</code>, <code>vs_seconds</code></td>
+<td>How MUCH of each human. Feeds the seconds-biased pooling (§4b) so a 4-second
+overlap cannot speak as loudly as a full shift.</td></tr>
+<tr><td>member dynamic shell: <b>age</b>, <b>position</b>, <b>handedness</b>,
+<b>season-lagged recent form</b>, <b>member gsc</b> (games since that member's own
+team change)</td>
+<td>Which VERSION of that human. 2019-Kane and 2025-Kane share an ID vector; the
+shell (computed as-of the game date) keeps it current. Form is <b>season-lagged by
+construction</b> — the F-1 echo rule: a teammate's on-ice numbers earned NEXT TO the
+focal player would reflect the focal player's own quality back into h_env (identity
+by reflection). Measured before fixing: naive-current form correlates 0.310 with
+focal talent, lagged form 0.267 — and the surviving correlation is genuine
+assortative line-building (good players ride together), which the tower SHOULD see.
+Member gsc: everyone settles after a move, not just the focal player.</td></tr>
+</table>
+
+<h3>3b. The situation</h3>
+<table>
+<tr><th>Input</th><th>Why</th></tr>
+<tr><td>score bucket, period, period-time bucket</td><td>Trailing teams attack; leading teams shell. Score effects are among the largest context effects in hockey analytics.</td></tr>
+<tr><td>zone start, faceoff location, start regime, entry mode, stoppage class, after-icing (+ OZ/DZ splits)</td><td>WHERE and HOW the stretch began. Measured on our windows: on-the-fly entries start ~12% better than DZ faceoffs; icing-trapped starts are materially worse. Zone information decays with a ~20-second half-life (T20) — the tower gets a zone-decay probe to confirm it learns that decay rather than smearing the start over the whole window.</td></tr>
+<tr><td>home/away, rink id, bench rights, long change, skater diff</td><td>Venue effects incl. measured scorekeeper quirks (T19; see §6c for why micro-stat gradients cannot touch the tower), last-change matchup rights, 2nd-period long change.</td></tr>
+</table>
+
+<h3>3c. The bench, the schedule, the system</h3>
+<table>
+<tr><th>Input</th><th>Why</th></tr>
+<tr><td>team priors: pace, xGF/xGA rates, goalie tier (EB-shrunk GSAA), for both teams</td><td>Everything NOT on the ice: bench depth, tempo of the system, the goalie behind them. All strictly pre-game (<code>_prior</code> columns, lag-audited).</td></tr>
+<tr><td>coach id + tenure</td><td>The system designer — scheme effects beyond roster. Thin data (82 coaches) ⇒ shrinkage; a brand-new coach is an UNK with tenure 0, which is itself signal.</td></tr>
+<tr><td>rest days, back-to-back</td><td>Fatigue. Computed from each team's own game-date sequence (audited: 13.6% b2b rate, league-real).</td></tr>
+<tr><td>focal <code>games_since_team_change</code></td><td>The settling-in curve, as an EXPLICIT input (F-2). Post-move adjustment is modeled as a curve the network can learn — instead of contaminating every ambient weight. At serving we integrate the projection over games 1..40 of the curve.</td></tr>
+<tr><td>entry-side timing (shift count, time since last shift, entered-after-start, entry offset)</td><td>Coach decisions made BEFORE the exposure — legal context ("inserted mid-chaos", "post-icing rescue shift").</td></tr>
+</table>
+
+<h3>3d. What is banned, and why (each ban cites its evidence)</h3>
+<table>
+<tr><th>Banned</th><th>Reason</th></tr>
+<tr><td>the focal player — anything</td><td>§2. The company's core discipline.</td></tr>
+<tr><td><code>duration</code> as an input</td><td>Windows end when whistles happen; whistles correlate with events. Measured stop-bias: +51%. Duration exists only as a loss weight.</td></tr>
+<tr><td>exit-side timing (<code>exited_before_end</code>, exit offset, stint variance)</td><td>Players leave the ice BECAUSE of what happened (goal against → change). Outcome-caused ⇒ using it = peeking at the label. Its entry-side twin stays legal — the asymmetry is the point.</td></tr>
+<tr><td>all in-window event counts (shots, plays, chaos metrics)</td><td>Outcomes wearing feature costumes.</td></tr>
+<tr><td><code>season</code> / era ids</td><td>Undefined at serving ("what season is a hypothetical trade?"). Era reality enters honestly through team priors, which drift with the league.</td></tr>
+<tr><td>matchup-quality %, standings priors</td><td>Traced to leaky computations in the legacy builder (full-game realized overlap weights; unverifiable as-of-date branch). Rebuilt versions may return; the traced ones may not.</td></tr>
+<tr><td>focal deployment priors (his old OZ share etc.)</td><td>They describe the OLD coach's choices. The destination's role template supplies deployment at serving — that's a lever (Phase B), not an environment fact.</td></tr>
+</table>
+
+<h2>4. The architecture itself</h2>
+
+<h3>4a. Member representation: static core ⊕ dynamic shell</h3>
+<div class="eq">member_j = MLP( id_vec_j(96) ⊕ shell_j )   where shell_j = [age, pos, hand, lagged_form, member_gsc]</div>
+<p>Why the split: identity vectors capture what's stable about a player (skill
+signature as seen from outside); the shell captures what changes (aging, form,
+settling). This split is also the <b>UNK mode</b>: a player the table has never seen
+— an AHL call-up today; an entire AHL roster in the future recruiting product —
+gets the UNK vector plus a REAL shell. The tower degrades gracefully from "I know
+this man" to "I know his type," which is precisely the future-product path (§9).</p>
+
+<h3>4b. Pooling: seconds-biased attention</h3>
+<div class="eq">attn_logit_j = q·member_j + log(seconds_j)  →  h_with = Σ softmax_j · member_j</div>
+<p>Why not a mean (treats a 3-second cameo like a full shift), why not max (one
+member dominates), why not plain attention (learns to over-focus, and can resurrect
+the fingerprint threat): the <code>log(seconds)</code> bias makes exposure the prior
+and lets attention adjust around it. Padding (id 0, seconds 0) is masked exactly
+— audited: padding conventions hold in 100% of 200k sampled windows.</p>
+
+<h3>4c. Context and fusion</h3>
+<div class="eq">h_ctx = MLP( embeds(score, zone, period, rink, coach, …) ⊕ team_priors ⊕ schedule )
+h_env = Fusion( [h_with, h_vs, h_ctx] + CLS )   — 2 pre-norm attention blocks → 256-d</div>
+<p>Fusion is attention (not concatenation) because context should modulate how the
+people matter: the same five opponents mean something different protecting a lead in
+the third than chasing in the first. Two blocks, not six: with ~1,700 identity
+vectors as the main learnable inventory, capacity is the enemy (§5c).</p>
+
+<h3>4d. Size: ~2M parameters, and why small is a feature</h3>
+<p>The identity table (~1.7k × 96) plus MLPs and two fusion blocks lands near 2M.
+The constraint is sample efficiency per PLAYER, not per row: 6.5M windows sounds
+enormous, but each identity vector is learned from only that player's appearances.
+A big tower would memorize windows; a small one is forced to learn hockey. (The GBDT
+twin in Phase B exists to referee exactly this: if a gradient-boosted tree on the
+tabular features matches the trunk, the neural machinery isn't earning its keep.)</p>
+
+<h2>5. Training — and every trap we know about</h2>
+
+<h3>5a. No loss of its own</h3>
+<p>The tower trains end-to-end with the Phase B trunk against window outcomes.
+"Environment quality" is not a thing we define; it's whatever representation makes
+the trunk's predictions right across two million windows. This is deliberate: any
+hand-built environment target (e.g. "predict slot-average xG") would cap the tower
+at reproducing our old averages. The price: every Phase B pathology can reach the
+tower through the gradient — which is why the gradient PLUMBING is part of the
+architecture (5b–5d).</p>
+
+<h3>5b. The weighting stack (who gets a vote)</h3>
+<table>
+<tr><th>Mechanism</th><th>What it prevents</th></tr>
+<tr><td>exposure weights (loss × seconds)</td><td>low-minute windows dominating: a 6-second rate observation is ~1/100th the vote of a 10-minute one</td></tr>
+<tr><td>heteroscedastic heads (predict mean AND variance)</td><td>noisy windows steering: the Gaussian NLL divides error by predicted σ² — the model learns short windows are noisy and automatically mutes them</td></tr>
+<tr><td>switch-weighting ×3 on post-move windows</td><td>the regime we sell being drowned by the settled majority. Safe now BECAUSE gsc is an explicit input (F-2): the adjustment is modeled, so upweighting doesn't smear it</td></tr>
+<tr><td><code>is_multistint</code> downweight</td><td>blended-row noise from multi-shift windows</td></tr>
+</table>
+
+<h3>5c. The probe scorecard (run every epoch; red = checkpoint rejected)</h3>
+<table>
+<tr><th>Probe</th><th>Question it asks</th><th>Failure means</th></tr>
+<tr><td>P3-incremental</td><td>does h_env predict focal talent better than raw teammate-quality features alone?</td><td>identity leaking via roster fingerprint → reject; widen dropout, starve IDs further</td></tr>
+<tr><td>zone-decay</td><td>does the zone-start effect in h_env decay with ~20s half-life as measured in data?</td><td>tower smears start effects over whole windows → context miscalibrated</td></tr>
+<tr><td>era probe</td><td>can h_env identify the season beyond what team priors explain?</td><td>era leakage → time-travel at serving</td></tr>
+<tr><td>coach probe</td><td>does coach embedding explain variance beyond roster?</td><td>(want SOME) scheme effects real vs. coach = roster proxy</td></tr>
+<tr><td>UNK-degradation</td><td>replace known members with UNK+shell: performance drop should be graceful, not cliff</td><td>tower depends on memorized identities → AHL mode dead</td></tr>
+</table>
+
+<h3>5d. Era and evaluation hygiene</h3>
+<p>Era-split checkpoints (≤2021 / 22 / 23 / 24); all ablation comparisons hold era
+fixed (B-3) — otherwise "the tower wins" can be an artifact of which seasons a run
+saw. Teammate dropout 20% doubles as augmentation and anti-fingerprint. 2018-19
+currently trains in shell-only mode for member form (no prior season on the surface
+yet — fills when the 2017-18 build lands; if it stalls, that season is excluded
+rather than trained on a hole).</p>
+
+<h2>6. The joint with Phase B (the combiner)</h2>
+<div class="eq">x = [ h_env(256) ⊕ talent_channel ⊕ bio ] → 4×768 SwiGLU residual trunk, FiLM-modulated by 17 levers → 10 heads</div>
+<h3>6a. Three pipes, physically separate</h3>
+<p>Environment (from A), talent (from C, <b>frozen</b> — gradients do not flow into
+talent), levers (the coach's controllable knobs: zone-start mix, matchup exposure…)
+enter through FiLM modulation, meaning the levers RESHAPE the computation rather than
+add to it — that's what lets us later answer "what if we used him differently?"
+without retraining. The separation is the product: "how good he is" can never trade
+places with "how he was used."</p>
+<h3>6b. Ten heads, one licensed ruler</h3>
+<p>Primary: MoneyPuck xG for/against (heteroscedastic Gaussian) + rush/rebound/chaos
+splits. Auxiliary witness: our in-house xG (agreement between rulers is a free
+consistency check). Counts (goals/shots) as Poisson with exposure offsets. Kendall-Gal
+uncertainty weighting balances the heads without hand-tuning.</p>
+<h3>6c. The T19 firewall that IS legitimate</h3>
+<p>Micro-stat heads (hits/giveaways/takeaways) train with gradients <b>detached from
+the tower</b>: arena scorers disagree by up to 2.25× on giveaways, and that noise may
+not sculpt h_env. (Contrast with §2b: we distrust firewalls protecting against
+identity, because identity leaks are subtle and adversarial; a gradient-detach against
+scorer noise is a one-line mechanical guarantee — the gradient literally does not
+exist. Different threat class, different confidence.)</p>
+<h3>6d. Two gates, two questions</h3>
+<p>The TOWER's gate: beat the slot-average environment (v0's crude average) in
+era-fixed ablation — does knowing the specific humans help? The TRUNK's gate: beat
+the GBDT twin — does the neural combiner beat a strong tabular baseline given the
+same inputs? Conflating these was an early design bug; they answer different
+questions and both must pass.</p>
+
+<h2>7. The joint with Phase C (the player side)</h2>
+<h3>7a. Talent as a residual — the engine of the proven 7.6%</h3>
+<div class="eq">talent(p) = EB-shrink( decay-weighted Σ [what p's windows produced − what the BASELINE says an average player produces in those exact windows] )</div>
+<p>Career-long, recency-decayed, league-demeaned (so league-wide drift doesn't
+masquerade as personal decline), shrunk toward zero when evidence is thin (fitted K
+in effective minutes — the 40-minute wonder cannot carry an extreme number anywhere).
+Computed out-of-fold: the baseline never saw the windows it judges.</p>
+<h3>7b. The double-count theorem, and K-1</h3>
+<blockquote>If the environment model is identity-blind, the residual "talent" of a
+player contains credit that actually belongs to his linemates. If you then upgrade
+the environment model to one that DOES credit linemates (the tower), and keep the old
+residuals, the same value is counted twice.</blockquote>
+<p>Concretely: v0's baseline doesn't know Draisaitl is elite, so some Draisaitl
+credit lives inside McDavid-linemates' talent scalars. In v0, the errors partially
+cancel (environment underclaims, talent overclaims). Ship the tower with old talent
+and the cancellation breaks: <b>systematic overprediction for star-adjacent players
+leaving their stars</b> — the exact GM question ("is he real without 97?") answered
+wrong, with confidence. Hence ship-gate K-1: before v1 ships, talent is RE-DERIVED
+as the residual against the TOWER's environment (one EM round: train tower → recompute
+residuals → verify the top/bottom-15 sniff still ranks hockey-sensibly). Non-negotiable.</p>
+<h3>7c. The v2 frontier (not in the MVP)</h3>
+<p>Phase C grows a style vector (rush sniper / net-front / point bomber — the 13,708
+pre-computed shot-personality cards are the raw material) which, interacted with the
+tower's people-vectors, becomes the chemistry/fit engine ("does a triggerman need a
+distributor?"). Gated behind an identifiability census — chemistry claims require
+enough co-occurrence data to be estimable, or they're astrology.</p>
+
+<h2>8. Serving: how a hypothetical becomes a number</h2>
+<p>Query: player → destination team → line/role. The scenario builder takes the
+destination slot's REAL recent windows (who was actually on that ice), substitutes
+the focal player's talent in Phase B, bootstraps ×2000 over those windows weighted
+by the JOINT future schedule (opponent, venue, rest — never independent marginals:
+no Frankenstein windows that never co-occur), integrates over the settling curve
+(games 1..40 via gsc), and emits: projected on-ice xGF% + a conformal band whose
+coverage was MEASURED on 860 historical moves (80.0% achieved vs 80% claimed),
+binned by evidence volume × intended-role-delta (the K-2 fix: a 3rd-liner queried
+as a 1st-liner draws his band from the wide-change error pool, not the average pool).
+Combinations outside the data's joint support get an explicit
+<code>extrapolated: true</code>; far outside → <code>REFUSED_OOS</code>. Refusal
+is a feature: it is what makes the other answers credible.</p>
+
+<h2>9. MVP alignment — and honest disalignment</h2>
+<div class="box"><b>The MVP (agreed July 2026):</b> enough proof to land an NHL team
+partnership or seed funding. Concretely: the engine (v0 already beats Marcel-class
+baselines by 7.6%, CI clear), sealed September predictions, the public scoreboard,
+and the market-calls log (gated by its own backtest). One target, one event, one raise.</div>
+<h3>9a. Where Phase A serves that goal</h3>
+<ul>
+<li><b>It is the upgrade path with a floor.</b> The tower ships ONLY if it beats v0
+on the same 860-move harness, CI-clear, all 7 gates. October's proof does not wait
+for it and cannot be hurt by it: worst case v0 ships and the tower iterates.</li>
+<li><b>It is the demo moment.</b> v0 can't answer "and what if he plays with Kane
+instead?" — the tower can (linemate overrides). That interactivity is what makes a
+GM demo feel like an engine, not a spreadsheet.</li>
+<li><b>It is the differentiation claim.</b> "First causal simulation engine in
+sports" needs do()-capable machinery — §1's factorization IS that machinery,
+defensible to a technical diligence partner.</li>
+<li><b>It compounds into the expansion story.</b> UNK/shell mode (§4a) is the AHL
+recruiting product's front door; the same tower serves both pitches.</li>
+</ul>
+<h3>9b. Where Phase A does NOT serve the MVP (read this part too)</h3>
+<ul>
+<li><b>October does not require it.</b> The sealed predictions can be v0's. If GPU
+access slips past ~mid-August, training a tower that must clear 7 gates before
+sealing gets tight — and the correct decision is to seal v0 and keep training.
+The plan already says this; saying it out loud here keeps us honest.</li>
+<li><b>The market-calls leg doesn't use it.</b> SOG-prop translation runs on shot
+cards + role minutes + v0 environment; win-totals on roster xG-churn. The Vegas
+proof is deliberately tower-independent (fewer moving parts under a deadline).</li>
+<li><b>It adds the K-1 obligation.</b> Shipping the tower forces the talent
+re-derivation and re-validation. That's a cost v0 never charges. It's paid once,
+by design, but it is real days.</li>
+<li><b>Its risk is real:</b> the honest prior is that the tower beats slot-average
+comfortably but beats v0's harness number by a MODEST margin first try (v0 is
+crude on environment but its talent channel — the thing that carries most signal —
+is identical). The gates exist because "neural = better" is a hypothesis, not
+an entitlement.</li>
+</ul>
+
+<h2>10. Questions you should grill me with (the reader's checklist)</h2>
+<ol>
+<li><span class="q">"If the tower never sees the player, how can the projection be
+about HIM?"</span> — Because Phase B injects him through the talent channel. The
+tower answers "what is this ice worth to a generic player"; talent shifts it to him.
+Chemistry (whether THIS ice suits THIS style) is v2 — ask me what we lose by
+deferring it.</li>
+<li><span class="q">"Five teammate IDs basically name the focal player. Why isn't
+that fatal?"</span> — Dropout + P3-incremental probe + K-1. Ask to see the probe
+numbers on the first real checkpoint.</li>
+<li><span class="q">"Why is teammate form allowed at all if it echoes him?"</span>
+— Season-lagged only; measured residual correlation is real assortativity. Exact
+pairwise leave-focal-out is the v1.1 upgrade; ask what it costs.</li>
+<li><span class="q">"What if the tower just fails?"</span> — v0 ships. The company
+never depends on the net. That is the point of the harness.</li>
+<li><span class="q">"Why should I believe the bands?"</span> — Because they were
+measured: 80.0% achieved on 860 real moves, and after K-2, per-cell (evidence ×
+role-delta), not just on average. Extrapolations are flagged, not disguised.</li>
+<li><span class="q">"What's the weakest input?"</span> — Serving-time opponent
+lineups (team known, five-on-ice sampled). Standing sensitivity ablation; ask for
+its number when the tower trains.</li>
+<li><span class="q">"Does any of this delay October?"</span> — No. GPU is the only
+gating resource, and v0 is the floor either way.</li>
+</ol>
+
+<h2>11. Status ledger (as of July 22, 2026)</h2>
+<table>
+<tr><th>Piece</th><th>State</th></tr>
+<tr><td>Training surface (6.49M windows, 7 seasons, member shells aligned)</td><td>BUILT · leak-audited (FLAGGED 0) · deep-audited (15 checks, ALL CLEAR ×3 seasons)</td></tr>
+<tr><td>Feature legality contract</td><td>enforced in code; every ban cites evidence</td></tr>
+<tr><td>Tower + trunk (v2.2, this paper)</td><td>specified; script 19 implements next (legacy encoder.py is the deprecated §2b design — do not train it)</td></tr>
+<tr><td>Probe suite v2</td><td>specified (§5c); implemented inside script 19</td></tr>
+<tr><td>GPU</td><td><b>the only blocker</b></td></tr>
+<tr><td>Gates for shipping v1 over v0</td><td>7, listed in ARCHITECTURE_PLAN §5 — including K-1 re-derivation and per-cell conformal coverage</td></tr>
+</table>
+
+<p style="margin-top:30px;color:#666;font-size:13.5px"><i>Internal references:
+ARCHITECTURE_PLAN.md v2.2 (canonical spec) · PHASE_A_FEATURES.md (feature-by-feature
+bias defenses) · AUDITOR_GUIDE.html (data provenance) · scripts 21–25 (surface build
++ audits). Every number in this paper regenerates from the repo.</i> 🏒</p>
+
+</body>
+</html>
